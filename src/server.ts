@@ -134,7 +134,7 @@ export function createServerFor(cfg: Config) {
       const s = createServer((req, res) => {
         handler(req, res).catch((e) => json(res, 500, { error: (e as Error).message.slice(0, 160) }));
       });
-      s.listen(port, () => console.log(`x402-tokens :${port}  ${cfg.publicUrl}`));
+      s.listen(port, "0.0.0.0", () => console.log(`x402-tokens :${port}  ${cfg.publicUrl}`));
       return s;
     },
   };
