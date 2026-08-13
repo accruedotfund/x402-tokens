@@ -1,0 +1,12 @@
+{
+  "underlying": "EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump",
+  "wrapped": "Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9",
+  "authority": "AqdXyPzN6s5KH8KpdnKJmhUipyDUxxGxbJ5Qk1YKghXT",
+  "bump": 255,
+  "escrow": "7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q",
+  "scratch": "7ygKTq5Yjcr9z46hoTU4pHqSkGY5ReTKrJUPa7FPHZ7W",
+  "treasuryAta": "9UoGqi83tbH8TDLTtLHMFgwLDc3PxXMWJcwCFXbVVwex",
+  "program": "FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE",
+  "feeBps": 20,
+  "createSig": "2Ayzdkh6w5cL7QNUG69B9u71BCZgtTuFAihnUiLyb8VP3oeR7joQ2ZUk12HMatDfpaFxPp6PsB9CXYEg6gbRMyv6"
+}

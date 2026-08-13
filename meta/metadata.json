@@ -7,6 +7,8 @@
   "createdOn": "https://pump.fun",
   "website": "https://x402-tokens.fly.dev",
   "twitter": "",
+  "pump": "https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump",
+  "wrapped": "Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9",
   "attributes": [
     { "trait_type": "scheme", "value": "x402 exact" },
     { "trait_type": "markup", "value": "3x USD at 402" },

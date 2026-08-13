@@ -5,7 +5,9 @@ const esc = (x: unknown) =>
 
 /** What you paste into an agent. Keep it imperative and complete. */
 export function clankerPrompt(cfg: Config): string {
-  const y = cfg.assets[0];
+  const rails = cfg.assets.map((a) =>
+    `- ${a.symbol}  mint ${a.mint}  ${a.feeBps}bps tax  price ${a.stableUsd ? `$${a.stableUsd} stable` : `Birdeye ${a.priceMint} at the 402`}`
+  ).join("\n");
   return `Use ${cfg.publicUrl} as an OpenAI-compatible inference endpoint. There is no API key.
 
 POST ${cfg.publicUrl}/v1/chat/completions
@@ -16,17 +18,19 @@ Body is a normal OpenRouter/OpenAI chat completion:
 
 You will get HTTP 402. That is the product, not an error.
 
-The JSON has accepts[]. Pick the ${y?.symbol ?? "yUSDCx"} row:
+accepts[] will include one row per live rail. Pick ONE:
+${rails}
+
+Every row:
 - network: ${cfg.network}
-- asset (mint): ${y?.mint ?? ""}
 - payTo: ${cfg.payTo}
-- feePayer: ${cfg.feePayer}   ← the tx feePayer MUST be this. you do not pay SOL.
-- maxAmountRequired: already ${cfg.markup}× OpenRouter USD, in raw token units, grossed up for the ${y?.feeBps ?? 20}bps transfer fee. do not reprice it.
+- feePayer: ${cfg.feePayer}   ← tx feePayer MUST be this. you do not pay SOL.
+- maxAmountRequired: already ${cfg.markup}× OpenRouter USD, in that token's raw units, grossed up for its transfer tax. do not reprice it.
 - facilitator: ${cfg.facilitator}
 
 Build one Solana legacy Transaction:
 1. feePayer = ${cfg.feePayer}
-2. exactly one Token-2022 TransferChecked: your ${y?.symbol ?? "yUSDCx"} ATA → payTo's ATA, amount = maxAmountRequired, decimals = ${y?.decimals ?? 6}, mint = asset
+2. exactly one Token-2022 TransferChecked: your ATA of the chosen mint → payTo's ATA, amount = maxAmountRequired, decimals = 6
 3. you sign as the token owner. leave the feePayer signature empty.
 4. serialize requireAllSignatures=false, base64 that bytes
 
@@ -35,9 +39,12 @@ X-PAYMENT header = base64 of this JSON (utf8):
 
 POST the SAME body again with X-PAYMENT set. Do not change model/messages/max_tokens after the 402 — the quote is for that body.
 
-On 200 you get a normal chat.completion. The OpenRouter key never leaves their host.
+On 200 you get a normal chat.completion.
 
-If you don't hold ${y?.symbol ?? "yUSDCx"}, wrap USDC (${y?.priceMint ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"}) with program FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE (escrow 2qLm8aCvn6gQVUFeQ7EC5J62Y95gFzc3vReHzD5d5Gj2). Raw USDC will not settle.
+Raw TOKEN (EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump) and raw USDC will not settle. Wrap first:
+- USDC → yUSDCx via FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE escrow 2qLm8aCvn6gQVUFeQ7EC5J62Y95gFzc3vReHzD5d5Gj2
+- TOKEN → wTOKEN via the same program, escrow 7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q
+Both wraps are Token-2022 with a 20bps transfer tax. Yield is that tax.
 
 Do not use api.cdp.coinbase.com. This service names ${cfg.facilitator}. GET ${cfg.publicUrl}/.well-known/x402.json and ${cfg.publicUrl}/prompt.txt if you want this text again.`;
 }
@@ -52,7 +59,6 @@ export function renderIndex(cfg: Config): string {
   const curl = `curl -sS ${cfg.publicUrl}/v1/chat/completions \\
   -H 'content-type: application/json' \\
   -d '{"model":"${cfg.defaultModel}","messages":[{"role":"user","content":"say hi"}]}'`;
-  const y = cfg.assets[0];
   const clanker = clankerPrompt(cfg);
 
   return `<!doctype html><html lang=en><meta charset=utf-8>
@@ -152,7 +158,7 @@ footer{color:var(--dim);font-size:.85rem}
       <button id=copyclanker type=button>copy prompt</button>
     </div>
     <pre id=clanker>${esc(clanker)}</pre>
-    <div class=meta>live rail: ${esc(y?.symbol ?? "yUSDCx")} · mint ${esc(y?.mint ?? "")} · payTo ${esc(cfg.payTo)}</div>
+    <div class=meta>rails: ${esc(cfg.assets.map((a) => a.symbol).join(" · "))} · payTo ${esc(cfg.payTo)}</div>
   </section>
 
   <section class=prove>
@@ -170,8 +176,8 @@ footer{color:var(--dim);font-size:.85rem}
   <section>
     <div class=kicker>for degenerates</div>
     <ol>
-      <li><strong>Wrap USDC → yUSDCx</strong> if you don't already hold it. Program <code>FrSERT…2NE</code>. The wrap is the spendable asset. Raw USDC is not.</li>
-      <li><strong>POST the same body again</strong> with header <code>X-PAYMENT</code> = base64 of an x402 payload whose transaction is a <code>TransferChecked</code> of <code>maxAmountRequired</code> yUSDCx to <code>${esc(cfg.payTo)}</code>, fee payer <code>${esc(cfg.feePayer)}</code>.</li>
+      <li><strong>Wrap first.</strong> Raw USDC and raw TOKEN will not settle. USDC → yUSDCx or TOKEN → wTOKEN. Same program, 20bps Token-2022 tax, yield stays in the wrap.</li>
+      <li><strong>POST the same body again</strong> with header <code>X-PAYMENT</code> = base64 of an x402 payload whose transaction is a <code>TransferChecked</code> of <code>maxAmountRequired</code> of the chosen wrap to <code>${esc(cfg.payTo)}</code>, fee payer <code>${esc(cfg.feePayer)}</code>.</li>
       <li>The facilitator at <a href="${esc(cfg.facilitator)}">${esc(cfg.facilitator)}</a> verifies and sponsors gas. You need no SOL.</li>
       <li>On 200 you get a normal OpenRouter chat completion. The key never leaves this host.</li>
     </ol>
@@ -180,12 +186,12 @@ footer{color:var(--dim);font-size:.85rem}
   <div class=grid>
     <div class=card>
       <h3>Price</h3>
-      <p>OpenRouter's published USD rate for the model, times ${esc(cfg.markup)}. yUSDCx is treated as $1. A memecoin wrap, when listed, is Birdeye spot of the underlying <em>at the 402</em> — not a cached print.</p>
+      <p>OpenRouter's published USD rate for the model, times ${esc(cfg.markup)}. yUSDCx is $1. wTOKEN is Birdeye spot of <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> <em>at the 402</em>. Both wraps take 20bps on transfer — that's the yield.</p>
     </div>
     <div class=card>
       <h3>What is live today</h3>
-      <p class=live>yUSDCx on Solana mainnet</p>
-      <p style="margin-top:.4rem">TOKEN the memecoin is not on this rail yet. We are proving the pipe on yUSDCx first. Same 3× USD math will apply to the wrap.</p>
+      <p class=live>yUSDCx · wTOKEN</p>
+      <p style="margin-top:.4rem">TOKEN <code>EVULo…pump</code> on <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">pump.fun</a>. Spendable rail is wTOKEN <code>Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9</code> — Token-2022, 20bps tax, PDA fee authority.</p>
     </div>
   </div>
 
