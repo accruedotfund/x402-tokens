@@ -117,7 +117,14 @@ button,.copy{
 button:hover,.copy:hover{filter:brightness(1.06)}
 button:disabled{opacity:.45;cursor:not-allowed}
 button.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
-button:focus-visible,.copy:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+button:focus-visible,.copy:focus-visible,a.try:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+a.try{
+  display:inline-flex;align-items:center;gap:.4rem;margin-top:1.15rem;
+  font:640 var(--1)/1 var(--sans);letter-spacing:-.02em;text-decoration:none;
+  border-radius:12px;padding:.9rem 1.15rem;border:1px solid var(--accent);
+  background:var(--accent);color:var(--accent-ink)
+}
+a.try:hover{filter:brightness(1.06);color:var(--accent-ink)}
 pre{
   margin:.6rem 0 0;padding:.85rem 1rem;border-radius:10px;overflow:auto;
   background:oklch(11% .014 165);border:1px solid var(--line);
@@ -146,6 +153,7 @@ footer{color:var(--dim);font-size:.85rem}
       <div class=kicker>x402 · openrouter · ${esc(cfg.markup)}× usd</div>
       <h1>pay <em>tokens</em> for tokens</h1>
       <p class=lede>OpenRouter with no API key. You pay in ${esc(rails)}. Paste the clanker prompt into whatever is holding your keys. The 402 names the exact amount, in USD, at that second, times ${esc(cfg.markup)}.</p>
+      <a class=try href="https://thunder-rose-pepper-zest.grok.me">try it yourself</a>
     </div>
     <img class=coin src=/token.jpg width=256 height=256 alt="TOKEN transit token">
   </div>
@@ -196,7 +204,8 @@ footer{color:var(--dim);font-size:.85rem}
   </div>
 
   <footer>
-    facilitator <a href="${esc(cfg.facilitator)}/supported">${esc(cfg.facilitator)}</a>
+    <a href="https://thunder-rose-pepper-zest.grok.me">try it yourself</a>
+    · facilitator <a href="${esc(cfg.facilitator)}/supported">${esc(cfg.facilitator)}</a>
     · source <a href="https://github.com/accruedotfund/x402-tokens">accruedotfund/x402-tokens</a>
     · <a href="/prompt.txt">prompt.txt</a>
     · <a href="/.well-known/x402.json">manifest</a>
