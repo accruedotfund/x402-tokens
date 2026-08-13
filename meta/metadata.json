@@ -1,0 +1,16 @@
+{
+  "name": "Token",
+  "symbol": "TOKEN",
+  "description": "The other kind of token. Pay TOKEN (wrapped) or yUSDCx over x402 and get LLM tokens back. Inference is priced at 3× OpenRouter's USD cost, converted at the spot USD value of the asset at the moment the 402 is issued. Wrap TOKEN with FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE to spend it.",
+  "image": "https://tokens.accrue.fund/token.jpg",
+  "showName": true,
+  "createdOn": "https://pump.fun",
+  "website": "https://tokens.accrue.fund",
+  "twitter": "",
+  "attributes": [
+    { "trait_type": "scheme", "value": "x402 exact" },
+    { "trait_type": "markup", "value": "3x USD at 402" },
+    { "trait_type": "wrap", "value": "token-wrap++" },
+    { "trait_type": "also accepts", "value": "yUSDCx" }
+  ]
+}
