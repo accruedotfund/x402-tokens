@@ -3,6 +3,45 @@ import type { Config } from "./config.js";
 const esc = (x: unknown) =>
   String(x).replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c] as string));
 
+/** What you paste into an agent. Keep it imperative and complete. */
+export function clankerPrompt(cfg: Config): string {
+  const y = cfg.assets[0];
+  return `Use ${cfg.publicUrl} as an OpenAI-compatible inference endpoint. There is no API key.
+
+POST ${cfg.publicUrl}/v1/chat/completions
+Content-Type: application/json
+
+Body is a normal OpenRouter/OpenAI chat completion:
+{"model":"${cfg.defaultModel}","messages":[{"role":"user","content":"..."}],"max_tokens":256}
+
+You will get HTTP 402. That is the product, not an error.
+
+The JSON has accepts[]. Pick the ${y?.symbol ?? "yUSDCx"} row:
+- network: ${cfg.network}
+- asset (mint): ${y?.mint ?? ""}
+- payTo: ${cfg.payTo}
+- feePayer: ${cfg.feePayer}   ← the tx feePayer MUST be this. you do not pay SOL.
+- maxAmountRequired: already ${cfg.markup}× OpenRouter USD, in raw token units, grossed up for the ${y?.feeBps ?? 20}bps transfer fee. do not reprice it.
+- facilitator: ${cfg.facilitator}
+
+Build one Solana legacy Transaction:
+1. feePayer = ${cfg.feePayer}
+2. exactly one Token-2022 TransferChecked: your ${y?.symbol ?? "yUSDCx"} ATA → payTo's ATA, amount = maxAmountRequired, decimals = ${y?.decimals ?? 6}, mint = asset
+3. you sign as the token owner. leave the feePayer signature empty.
+4. serialize requireAllSignatures=false, base64 that bytes
+
+X-PAYMENT header = base64 of this JSON (utf8):
+{"x402Version":1,"scheme":"exact","network":"${cfg.network}","payload":{"transaction":"<base64-tx>"}}
+
+POST the SAME body again with X-PAYMENT set. Do not change model/messages/max_tokens after the 402 — the quote is for that body.
+
+On 200 you get a normal chat.completion. The OpenRouter key never leaves their host.
+
+If you don't hold ${y?.symbol ?? "yUSDCx"}, wrap USDC (${y?.priceMint ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"}) with program FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE (escrow 2qLm8aCvn6gQVUFeQ7EC5J62Y95gFzc3vReHzD5d5Gj2). Raw USDC will not settle.
+
+Do not use api.cdp.coinbase.com. This service names ${cfg.facilitator}. GET ${cfg.publicUrl}/.well-known/x402.json and ${cfg.publicUrl}/prompt.txt if you want this text again.`;
+}
+
 /**
  * Work pattern: Decide, with a Learn spine.
  * One action — prove the 402 — sits above the explanation.
@@ -13,6 +52,8 @@ export function renderIndex(cfg: Config): string {
   const curl = `curl -sS ${cfg.publicUrl}/v1/chat/completions \\
   -H 'content-type: application/json' \\
   -d '{"model":"${cfg.defaultModel}","messages":[{"role":"user","content":"say hi"}]}'`;
+  const y = cfg.assets[0];
+  const clanker = clankerPrompt(cfg);
 
   return `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -74,7 +115,7 @@ button:focus-visible,.copy:focus-visible{outline:2px solid var(--accent);outline
 pre{
   margin:.6rem 0 0;padding:.85rem 1rem;border-radius:10px;overflow:auto;
   background:oklch(11% .014 165);border:1px solid var(--line);
-  font: .82rem/1.45 var(--mono);color:var(--money);max-height:22rem
+  font: .82rem/1.45 var(--mono);color:var(--money);max-height:28rem
 }
 pre.err{color:var(--bad)}
 .meta{color:var(--dim);font-family:var(--mono);font-size:.75rem;margin-top:.45rem}
@@ -98,10 +139,21 @@ footer{color:var(--dim);font-size:.85rem}
     <div>
       <div class=kicker>x402 · openrouter · ${esc(cfg.markup)}× usd</div>
       <h1>pay <em>tokens</em> for tokens</h1>
-      <p class=lede>OpenRouter with no API key. You pay in ${esc(rails)}. The 402 names the exact amount, in USD, at that second, times ${esc(cfg.markup)}.</p>
+      <p class=lede>OpenRouter with no API key. You pay in ${esc(rails)}. Paste the clanker prompt into whatever is holding your keys. The 402 names the exact amount, in USD, at that second, times ${esc(cfg.markup)}.</p>
     </div>
     <img class=coin src=/token.jpg width=256 height=256 alt="TOKEN transit token">
   </div>
+
+  <section class=prove>
+    <div class=kicker>prompt your clanker</div>
+    <h2>Dump this into Claude / Grok / Codex. It has everything.</h2>
+    <p class=lede style="margin-top:.4rem;font-size:var(--0)">No SDK. No OpenRouter key. If it can POST and sign one Solana <code>TransferChecked</code>, it can buy inference here. Raw prompt also at <a href="/prompt.txt"><code>/prompt.txt</code></a>.</p>
+    <div class=row>
+      <button id=copyclanker type=button>copy prompt</button>
+    </div>
+    <pre id=clanker>${esc(clanker)}</pre>
+    <div class=meta>live rail: ${esc(y?.symbol ?? "yUSDCx")} · mint ${esc(y?.mint ?? "")} · payTo ${esc(cfg.payTo)}</div>
+  </section>
 
   <section class=prove>
     <div class=kicker>prove it</div>
@@ -140,6 +192,7 @@ footer{color:var(--dim);font-size:.85rem}
   <footer>
     facilitator <a href="${esc(cfg.facilitator)}/supported">${esc(cfg.facilitator)}</a>
     · source <a href="https://github.com/accruedotfund/x402-tokens">accruedotfund/x402-tokens</a>
+    · <a href="/prompt.txt">prompt.txt</a>
     · <a href="/.well-known/x402.json">manifest</a>
     · <a href="/healthz">healthz</a>
   </footer>
@@ -149,6 +202,12 @@ const out = document.getElementById("out");
 const status = document.getElementById("status");
 const hit = document.getElementById("hit");
 const curl = ${JSON.stringify(curl)};
+const clanker = ${JSON.stringify(clanker)};
+document.getElementById("copyclanker").onclick = async () => {
+  await navigator.clipboard.writeText(clanker);
+  document.getElementById("copyclanker").textContent = "copied";
+  setTimeout(() => document.getElementById("copyclanker").textContent = "copy prompt", 1200);
+};
 document.getElementById("copycurl").onclick = async () => {
   await navigator.clipboard.writeText(curl);
   document.getElementById("copycurl").textContent = "copied";

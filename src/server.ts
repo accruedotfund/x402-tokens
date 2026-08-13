@@ -4,7 +4,7 @@ import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "./config.js";
 import { complete, listModels } from "./openrouter.js";
-import { renderIndex } from "./page.js";
+import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive } from "./quote.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 
@@ -50,6 +50,12 @@ export function createServerFor(cfg: Config) {
       if (!existsSync(p)) return json(res, 404, { error: "no metadata" });
       res.writeHead(200, { "content-type": "application/json", "cache-control": "public, max-age=60" });
       return res.end(readFileSync(p));
+    }
+
+    if (req.method === "GET" && (url.pathname === "/prompt.txt" || url.pathname === "/clanker.txt")) {
+      const text = clankerPrompt(cfg);
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-length": Buffer.byteLength(text) });
+      return res.end(text);
     }
 
     if (req.method === "GET" && url.pathname === "/healthz") {
