@@ -9,6 +9,7 @@
   "twitter": "",
   "pump": "https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump",
   "wrapped": "Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9",
+  "wrappedSymbol": "wTOKENx",
   "attributes": [
     { "trait_type": "scheme", "value": "x402 exact" },
     { "trait_type": "markup", "value": "3x USD at 402" },

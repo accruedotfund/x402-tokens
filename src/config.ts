@@ -53,7 +53,7 @@ export function loadConfig(): Config {
   // allowlists it. Setting MEME_MINT is what turns the rail on.
   if (process.env.MEME_MINT) {
     assets.push({
-      symbol: opt("MEME_SYMBOL", "wTOKEN"),
+      symbol: opt("MEME_SYMBOL", "wTOKENx"),
       mint: process.env.MEME_MINT,
       decimals: Number(opt("MEME_DECIMALS", "6")),
       feeBps: Number(opt("MEME_FEE_BPS", "20")),

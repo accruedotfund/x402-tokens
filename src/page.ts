@@ -43,7 +43,7 @@ On 200 you get a normal chat.completion.
 
 Raw TOKEN (EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump) and raw USDC will not settle. Wrap first:
 - USDC → yUSDCx via FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE escrow 2qLm8aCvn6gQVUFeQ7EC5J62Y95gFzc3vReHzD5d5Gj2
-- TOKEN → wTOKEN via the same program, escrow 7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q
+- TOKEN → wTOKENx via the same program, escrow 7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q
 Both wraps are Token-2022 with a 20bps transfer tax. Yield is that tax.
 
 Do not use api.cdp.coinbase.com. This service names ${cfg.facilitator}. GET ${cfg.publicUrl}/.well-known/x402.json and ${cfg.publicUrl}/prompt.txt if you want this text again.`;
@@ -176,7 +176,7 @@ footer{color:var(--dim);font-size:.85rem}
   <section>
     <div class=kicker>for degenerates</div>
     <ol>
-      <li><strong>Wrap first.</strong> Raw USDC and raw TOKEN will not settle. USDC → yUSDCx or TOKEN → wTOKEN. Same program, 20bps Token-2022 tax, yield stays in the wrap.</li>
+      <li><strong>Wrap first.</strong> Raw USDC and raw TOKEN will not settle. USDC → yUSDCx or TOKEN → wTOKENx. Same program, 20bps Token-2022 tax, yield stays in the wrap.</li>
       <li><strong>POST the same body again</strong> with header <code>X-PAYMENT</code> = base64 of an x402 payload whose transaction is a <code>TransferChecked</code> of <code>maxAmountRequired</code> of the chosen wrap to <code>${esc(cfg.payTo)}</code>, fee payer <code>${esc(cfg.feePayer)}</code>.</li>
       <li>The facilitator at <a href="${esc(cfg.facilitator)}">${esc(cfg.facilitator)}</a> verifies and sponsors gas. You need no SOL.</li>
       <li>On 200 you get a normal OpenRouter chat completion. The key never leaves this host.</li>
@@ -186,12 +186,12 @@ footer{color:var(--dim);font-size:.85rem}
   <div class=grid>
     <div class=card>
       <h3>Price</h3>
-      <p>OpenRouter's published USD rate for the model, times ${esc(cfg.markup)}. yUSDCx is $1. wTOKEN is Birdeye spot of <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> <em>at the 402</em>. Both wraps take 20bps on transfer — that's the yield.</p>
+      <p>OpenRouter's published USD rate for the model, times ${esc(cfg.markup)}. yUSDCx is $1. wTOKENx is Birdeye spot of <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> <em>at the 402</em>. Both wraps take 20bps on transfer — that's the yield.</p>
     </div>
     <div class=card>
       <h3>What is live today</h3>
-      <p class=live>yUSDCx · wTOKEN</p>
-      <p style="margin-top:.4rem">TOKEN <code>EVULo…pump</code> on <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">pump.fun</a>. Spendable rail is wTOKEN <code>Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9</code> — Token-2022, 20bps tax, PDA fee authority.</p>
+      <p class=live>yUSDCx · wTOKENx</p>
+      <p style="margin-top:.4rem">TOKEN <code>EVULo…pump</code> on <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">pump.fun</a>. Spendable rail is wTOKENx <code>Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9</code> — Token-2022, 20bps tax, PDA fee authority.</p>
     </div>
   </div>
 
