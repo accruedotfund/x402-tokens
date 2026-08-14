@@ -6,7 +6,7 @@ import { loadConfig, type Config } from "./config.js";
 import { complete, listModels } from "./openrouter.js";
 import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive } from "./quote.js";
-import { prepare, type LecoreResult } from "./lecore.js";
+import { attach, bindPassthrough, ContextGoneError, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -97,6 +97,19 @@ export function createServerFor(cfg: Config) {
       return json(res, 200, { object: "list", data });
     }
 
+    // "The body never ships twice": bind a corpus once, then ask with
+    // X-HRR-Context on small bodies. Free — see bindPassthrough for why.
+    if (req.method === "POST" && url.pathname === "/v1/hrr/bind") {
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        return json(res, 400, { error: "invalid json" });
+      }
+      const { status, payload } = await bindPassthrough(cfg, body);
+      return json(res, status, payload);
+    }
+
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       let body: { model?: string; messages?: unknown; max_tokens?: number; stream?: boolean };
       try {
@@ -110,7 +123,8 @@ export function createServerFor(cfg: Config) {
       // estimateTokens(messages), so spilling after the quote would bill the
       // caller 3x on the whole book and hand them the discount they already
       // paid for. Thread key lets a caller keep one holographic context.
-      const thread = (req.headers["x-hrr-context"] as string | undefined)
+      const headerCtx = req.headers["x-hrr-context"] as string | undefined;
+      const thread = headerCtx
         || (typeof (body as { user?: unknown }).user === "string" ? (body as { user: string }).user : undefined);
       let prepped: Record<string, unknown> = body as Record<string, unknown>;
       let lecoreInfo: LecoreResult["info"];
@@ -120,6 +134,24 @@ export function createServerFor(cfg: Config) {
         lecoreInfo = r.info;
       } catch (e) {
         return json(res, 503, { error: (e as Error).message });
+      }
+
+      // ATTACH: an EXPLICIT X-HRR-Context on a body too small to spill means
+      // "the corpus is already bound — recall against it". Header only:
+      // body.user is a stock OpenAI field and treating it as a context id
+      // would 404 every ordinary small request that happens to set it.
+      // A dead context 404s BEFORE the 402 so a stale manifest re-binds free.
+      if (headerCtx && !lecoreInfo.engaged && cfg.lecoreUrl) {
+        try {
+          const a = await attach(cfg, prepped, headerCtx);
+          prepped = a.body;
+          lecoreInfo = a.info;
+        } catch (e) {
+          if (e instanceof ContextGoneError) {
+            return json(res, 404, { error: { message: "hrr_context_not_found", code: "context_not_found", context_id: headerCtx } });
+          }
+          return json(res, 503, { error: (e as Error).message });
+        }
       }
 
       // price the counterfactual when leCore engaged: the caller pays a fraction of

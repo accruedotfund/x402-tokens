@@ -28,12 +28,26 @@ export interface LecoreResult {
   body: Record<string, unknown>;
   info: {
     engaged: boolean;
+    /** "spill" = big body carved + bound here; "attach" = caller referenced a
+     *  pre-bound context via X-HRR-Context and we only recalled. */
+    mode?: "spill" | "attach";
     reason?: string;
     contextId?: string;
     tokensBefore: number;
     tokensAfter: number;
     spilledTokens?: number;
+    /** attach only: how many passages recall returned. */
+    recalled?: number;
   };
+}
+
+/** The context named in X-HRR-Context no longer exists on the sidecar
+ *  (wiped, expired, or never bound here). Surfaced as HTTP 404 BEFORE the 402
+ *  so a client with a stale manifest can re-bind without paying. */
+export class ContextGoneError extends Error {
+  constructor(public contextId: string) {
+    super(`hrr context not found: ${contextId}`);
+  }
 }
 
 interface Msg { role?: string; content?: unknown }
@@ -67,7 +81,7 @@ function split(msgs: Msg[], keepTokens: number): { live: Msg[]; spill: Msg[] } {
   return { live, spill: msgs.slice(0, i + 1) };
 }
 
-async function post(url: string, payload: unknown, ms: number, key?: string): Promise<unknown> {
+async function postRaw(url: string, payload: unknown, ms: number, key?: string): Promise<{ status: number; json: unknown }> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), ms);
   try {
@@ -77,11 +91,17 @@ async function post(url: string, payload: unknown, ms: number, key?: string): Pr
       body: JSON.stringify(payload),
       signal: ac.signal,
     });
-    if (!r.ok) throw new Error(`${url} -> ${r.status}`);
-    return await r.json();
+    const json = await r.json().catch(() => ({}));
+    return { status: r.status, json };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function post(url: string, payload: unknown, ms: number, key?: string): Promise<unknown> {
+  const { status, json } = await postRaw(url, payload, ms, key);
+  if (status < 200 || status >= 300) throw new Error(`${url} -> ${status}`);
+  return json;
 }
 
 export async function prepare(
@@ -112,23 +132,15 @@ export async function prepare(
     if (body_.length > tailChars * 2) {
       const head = body_.slice(0, body_.length - tailChars);
       const tail = body_.slice(body_.length - tailChars);
-      // OVERLAPPING WINDOWS. Fixed non-overlapping slices silently destroy any
-      // fact that straddles a boundary: MEASURED on a 500k needle at position
-      // 0.02, the 57-char needle line appeared in ZERO of 1,584 chunks
-      // (`needle_chunk=[]`, all 1,584 bound), so retrieval could never have
-      // found it and the miss looked like a ranker failure. It was a chunker
-      // failure. Whether a fact is cut in half depends only on where it lands,
-      // which is why the miss was positional and perfectly reproducible.
-      // An overlap >= the longest fact guarantees every fact is wholly
-      // contained in at least one window.
-      const chunk = cfg.lecoreChunkChars;
-      const overlap = Math.min(cfg.lecoreChunkOverlap, Math.floor(chunk / 2));
-      const stride = Math.max(1, chunk - overlap);
-      const passages: Msg[] = [];
-      for (let i = 0; i < head.length; i += stride) {
-        passages.push({ role: live[lastIdx].role ?? "user", content: head.slice(i, i + chunk) });
-        if (i + chunk >= head.length) break;
-      }
+      // CHUNKING IS LECORE'S DECISION, NOT OURS. We used to slice the head
+      // into fixed windows here, which silently destroys any fact that
+      // straddles a boundary — MEASURED, a 57-char needle appeared in ZERO of
+      // 1,584 chunks, so retrieval was asked to find text that no longer
+      // existed. leCore's chunk_text says exactly this in its docstring ("a
+      // fact split across two chunks is retrievable from neither") and splits
+      // on paragraphs instead. So send the head WHOLE and let the sidecar
+      // chunk it with leCore; `chunk: true` on bind does that server-side.
+      const passages: Msg[] = [{ role: live[lastIdx].role ?? "user", content: head }];
       spill = [...live.slice(0, lastIdx), ...passages];
       live = [{ ...live[lastIdx], content: tail }];
     }
@@ -142,7 +154,9 @@ export async function prepare(
     if (items.length === 0) return off("spill was empty after flattening");
 
     const bind = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/bind`,
-      { tenant_id: cfg.lecoreTenant, items, ...(thread ? { context_id: thread } : {}) }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { context_id?: string };
+      { tenant_id: cfg.lecoreTenant, items, chunk: true,
+       chunk_max_chars: cfg.lecoreChunkChars, chunk_overlap: cfg.lecoreChunkOverlap,
+       ...(thread ? { context_id: thread } : {}) }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { context_id?: string };
     const contextId = bind?.context_id;
     if (!contextId) throw new Error("bind returned no context_id");
 
@@ -176,4 +190,90 @@ export async function prepare(
     if (cfg.lecoreRequired) throw new Error(`lecore_unavailable: ${why}`);
     return off(`fail-open: ${why}`);
   }
+}
+
+/**
+ * ATTACH: the caller already bound a corpus (POST /v1/hrr/bind) and now sends
+ * a SMALL body naming it via X-HRR-Context. The body never ships twice — we
+ * recall top-k against the pre-bound context and prepend it, instead of asking
+ * the caller to re-upload megabytes so `prepare` can re-carve them.
+ *
+ * BILLING BASIS IS THE MARKUP PATH, ON PURPOSE. tokensAfter > tokensBefore
+ * here (the body grew by the recalled slice), so quoteRequest's counterfactual
+ * guard never fires and the caller pays markup x a tiny body — typically far
+ * cheaper than the counterfactual on the full corpus. The receipt stays honest
+ * about that basis (pricing: "markup", mode: "attach").
+ *
+ * A MISSING CONTEXT IS 404, NOT FAIL-OPEN. The caller asked a question about a
+ * corpus we do not have; answering without it would be a confident lie billed
+ * as memory. ContextGoneError -> HTTP 404 pre-402, so a stale client manifest
+ * re-binds without paying. Other sidecar failures honor LECORE_REQUIRED.
+ */
+export async function attach(
+  cfg: Config,
+  body: Record<string, unknown>,
+  contextId: string,
+): Promise<LecoreResult> {
+  const msgs = (Array.isArray(body.messages) ? body.messages : []) as Msg[];
+  const before = estimateTokens(body.messages);
+  const off = (r: string): LecoreResult => ({ body, info: { engaged: false, mode: "attach", reason: r, contextId, tokensBefore: before, tokensAfter: before } });
+  if (!cfg.lecoreUrl) return off("LECORE_HRR_URL unset");
+
+  const query = askOf(text(msgs[msgs.length - 1]?.content), cfg.lecoreQueryChars);
+  if (!query) return off("empty ask");
+
+  try {
+    const { status, json: rec } = await postRaw(`${cfg.lecoreUrl}/internal/v1/hrr/recall`,
+      { tenant_id: cfg.lecoreTenant, context_id: contextId, query, top_k: cfg.lecoreTopK },
+      cfg.lecoreTimeoutMs, cfg.lecoreKey);
+    if (status === 404) throw new ContextGoneError(contextId);
+    if (status < 200 || status >= 300) throw new Error(`recall -> ${status}`);
+    const items = ((rec as { items?: Array<{ text?: string }> })?.items ?? []);
+    const slice = items.map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
+    const rebuilt: Msg[] = slice
+      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}` }, ...msgs]
+      : msgs;
+    const after = estimateTokens(rebuilt);
+    return {
+      body: { ...body, messages: rebuilt },
+      info: { engaged: true, mode: "attach", contextId, tokensBefore: before, tokensAfter: after, recalled: items.length },
+    };
+  } catch (e) {
+    if (e instanceof ContextGoneError) throw e;
+    const why = (e as Error).message.slice(0, 120);
+    if (cfg.lecoreRequired) throw new Error(`lecore_unavailable: ${why}`);
+    return off(`fail-open attach: ${why}`);
+  }
+}
+
+/**
+ * Thin public bind passthrough -> sidecar /internal/v1/hrr/bind.
+ * Free (no 402): auto-spill already binds unpaid bodies before the payment
+ * check, so this adds no exposure — it just lets a client bind ONCE and then
+ * ask forever with X-HRR-Context. Chunking stays leCore's decision
+ * (chunk: true), same as the spill path. item_ids are dropped from the reply:
+ * a 3.7MB corpus chunks into thousands and the caller only needs the id.
+ */
+export async function bindPassthrough(
+  cfg: Config,
+  body: { items?: Array<{ text?: string }>; corpus?: string; context_id?: string; mode?: string },
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  const items = Array.isArray(body.items) && body.items.length
+    ? body.items
+    : (typeof body.corpus === "string" && body.corpus.trim() ? [{ text: body.corpus }] : []);
+  if (!items.length) return { status: 400, payload: { error: "items (array of {text}) or corpus (string) required" } };
+
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/hrr/bind`,
+    { tenant_id: cfg.lecoreTenant, items, chunk: true,
+      chunk_max_chars: cfg.lecoreChunkChars, chunk_overlap: cfg.lecoreChunkOverlap,
+      ...(body.context_id ? { context_id: body.context_id } : {}),
+      ...(body.mode ? { mode: body.mode } : {}) },
+    cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string; code?: string };
+    return { status, payload: { error: j?.error || `bind -> ${status}`, code: j?.code } };
+  }
+  const out = json as { object?: string; context_id?: string; bound?: number };
+  return { status: 200, payload: { object: out.object ?? "hrr.context", context_id: out.context_id, bound: out.bound } };
 }
