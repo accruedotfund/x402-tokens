@@ -119,19 +119,40 @@ export async function verify(cfg: Config, header: string, reqs: Requirements[]):
   } catch {
     return { ok: false, reason: "malformed X-PAYMENT header" };
   }
-  const picked = reqs.find((r) => r.network === payload.network) ?? reqs[0];
-  if (!picked) return { ok: false, reason: "no matching requirements" };
-  try {
-    const r = await fetch(`${cfg.facilitator}/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ paymentPayload: payload, paymentRequirements: picked }),
-    });
-    const j = (await r.json()) as { isValid?: boolean; invalidReason?: string; payer?: string };
-    return { ok: !!j.isValid, reason: j.invalidReason, picked, payer: j.payer };
-  } catch (e) {
-    return { ok: false, reason: `facilitator unreachable: ${(e as Error).message.slice(0, 80)}` };
+  // One network can carry SEVERAL rows (eip155:4663 quotes wUSDGx plus the
+  // memecoin twins). The x402 exact payload does not name its asset — the
+  // asset only exists inside the signed EIP-712 domain — so network-only
+  // matching pinned every RH payment to the first row and the facilitator
+  // answered "signature does not match payer" for any other asset. Match by
+  // network, order by signed-value == row's maxAmountRequired (raw amounts
+  // differ per asset), and let the facilitator's verify break any remaining
+  // tie by trying each candidate until one validates.
+  const sameNet = reqs.filter((r) => r.network === payload.network);
+  const authValue = String(
+    (payload as { payload?: { authorization?: { value?: unknown } } }).payload?.authorization?.value ?? "",
+  );
+  const candidates = [
+    ...sameNet.filter((r) => r.maxAmountRequired === authValue),
+    ...sameNet.filter((r) => r.maxAmountRequired !== authValue),
+  ];
+  if (!candidates.length && reqs[0]) candidates.push(reqs[0]);
+  if (!candidates.length) return { ok: false, reason: "no matching requirements" };
+  let lastReason: string | undefined;
+  for (const picked of candidates) {
+    try {
+      const r = await fetch(`${cfg.facilitator}/verify`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paymentPayload: payload, paymentRequirements: picked }),
+      });
+      const j = (await r.json()) as { isValid?: boolean; invalidReason?: string; payer?: string };
+      if (j.isValid) return { ok: true, picked, payer: j.payer };
+      lastReason = j.invalidReason;
+    } catch (e) {
+      return { ok: false, reason: `facilitator unreachable: ${(e as Error).message.slice(0, 80)}` };
+    }
   }
+  return { ok: false, reason: lastReason ?? "no candidate row validated", picked: candidates[0] };
 }
 
 export async function settle(cfg: Config, header: string, picked: Requirements) {
