@@ -43,6 +43,16 @@ const text = (c: unknown): string =>
     : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String((p as { text: unknown }).text) : "")).join("\n")
       : "";
 
+/** The ASK inside a body that also carries corpus: last paragraph, capped.
+ *  Used only as the retrieval query — the model still receives the full tail. */
+export function askOf(s: string, max: number): string {
+  const t = (s || "").trimEnd();
+  if (t.length <= max) return t.trim();
+  const para = t.split(/\n\s*\n/).pop() || t;
+  return (para.length <= max ? para : para.slice(-max)).trim();
+}
+
+
 /** Newest-first walk: keep whole recent turns inside the live window, spill the rest. */
 function split(msgs: Msg[], keepTokens: number): { live: Msg[]; spill: Msg[] } {
   const live: Msg[] = [];
@@ -86,7 +96,31 @@ export async function prepare(
   if (!cfg.lecoreUrl) return off("LECORE_HRR_URL unset");
   if (before <= cfg.lecoreSpillTokens) return off("under spill threshold");
 
-  const { live, spill } = split(msgs, cfg.lecoreSpillTokens);
+  let { live, spill } = split(msgs, cfg.lecoreSpillTokens);
+
+  // INTRA-MESSAGE SPILL. Turn-granularity is not enough: a needle-in-a-haystack
+  // prompt (and any pasted document) is ONE message holding the whole corpus AND
+  // the question, so message-level splitting finds nothing older than the live
+  // window and leCore no-ops on exactly the case it exists for. Measured on
+  // context-bench NIAH: 10,345 tokens, engaged=false, answered by raw attention.
+  // So when the live window is still oversized, carve the LAST message: keep its
+  // tail (the actual ask) and spill the head as passages.
+  if (spill.length === 0 && live.length > 0) {
+    const lastIdx = live.length - 1;
+    const body_ = text(live[lastIdx].content);
+    const tailChars = cfg.lecoreTailChars;
+    if (body_.length > tailChars * 2) {
+      const head = body_.slice(0, body_.length - tailChars);
+      const tail = body_.slice(body_.length - tailChars);
+      const chunk = cfg.lecoreChunkChars;
+      const passages: Msg[] = [];
+      for (let i = 0; i < head.length; i += chunk) {
+        passages.push({ role: live[lastIdx].role ?? "user", content: head.slice(i, i + chunk) });
+      }
+      spill = [...live.slice(0, lastIdx), ...passages];
+      live = [{ ...live[lastIdx], content: tail }];
+    }
+  }
   if (spill.length === 0) return off("nothing older than the live window");
 
   try {
@@ -101,7 +135,17 @@ export async function prepare(
     if (!contextId) throw new Error("bind returned no context_id");
 
     // 2. RECALL the slice relevant to the live ask. This is what the user pays for.
-    const query = text(live[live.length - 1]?.content) || text(msgs[msgs.length - 1]?.content);
+    //
+    // SEARCH WITH THE ASK, NOT THE ASK PLUS A PAGE OF THE CORPUS. The tail we
+    // forward to the model is deliberately generous (LECORE_TAIL_CHARS, so the
+    // model keeps local context), but using all of it as the QUERY is a bug that
+    // silently inverts the ranking: measured on a 15k NIAH, a 2,000-char tail was
+    // ~1,900 chars of filler, so the query vector looked like filler and the
+    // filler chunks won at cosine 0.90 while the needle -- the least filler-like
+    // passage in the corpus -- never made top-8. The ranker was right; the
+    // question was wrong. Search with the last paragraph (the actual ask).
+    const query = askOf(text(live[live.length - 1]?.content) || text(msgs[msgs.length - 1]?.content),
+                        cfg.lecoreQueryChars);
     const rec = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/recall`,
       { tenant_id: cfg.lecoreTenant, context_id: contextId, query, top_k: cfg.lecoreTopK }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as
       { items?: Array<{ text?: string }> };

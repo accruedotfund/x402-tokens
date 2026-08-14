@@ -24,15 +24,49 @@ export interface Quote {
   billedUsd: number;
   pricedAt: string;
   accepts: QuoteLine[];
+  /** "counterfactual" = discounted against what buying direct would cost. */
+  pricing: "markup" | "counterfactual";
+  directUsd?: number;
+  discount?: number;
+  savesVsDirect?: number;
+  flooredAtCost?: boolean;
 }
 
-export async function quoteRequest(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }): Promise<Quote> {
+export async function quoteRequest(
+  cfg: Config,
+  body: { model?: string; messages?: unknown; max_tokens?: number },
+  counterfactualTokens?: number,
+): Promise<Quote> {
   const modelId = body.model || cfg.defaultModel;
   const model = await getModel(cfg.openrouterUrl, cfg.openrouterKey, modelId);
   const promptTokens = estimateTokens(body.messages);
   const maxOut = Math.min(Math.max(1, Number(body.max_tokens ?? 256)), 4096);
   const baseUsd = openrouterUsd(model.prompt, model.completion, promptTokens, maxOut);
-  const billedUsd = baseUsd * cfg.markup;
+
+  // COUNTERFACTUAL PRICING. A markup on the tokens we forward is
+  // anti-correlated with a product whose whole job is to forward fewer tokens:
+  // MEASURED on a 60k needle, leCore cut a $0.021372 direct call to $0.000367 of
+  // real cost, so the same 3x markup that earned $0.042744/call without leCore
+  // earned $0.000734 WITH it -- shipping the feature cut revenue 58x. Charging
+  // 2x post-spill makes it worse, not better.
+  //
+  // So when leCore engaged we price against what the caller WOULD have paid
+  // buying this body direct (counterfactualTokens = pre-spill), discounted.
+  // At discount 0.5 the caller pays half of list and we clear ~14x today's
+  // margin. This is value-based pricing and the storefront must say so in those
+  // words -- "half the price of buying direct", never "3x provider take", which
+  // becomes a lie the moment someone computes the real token spend.
+  //
+  // The floor exists because a discount on a pathological body could otherwise
+  // price under our own cost.
+  const direct = counterfactualTokens && counterfactualTokens > promptTokens
+    ? openrouterUsd(model.prompt, model.completion, counterfactualTokens, maxOut)
+    : null;
+  const counterfactual = direct !== null && cfg.discount > 0;
+  const floorUsd = baseUsd * cfg.floorMultiple;
+  const billedUsd = counterfactual
+    ? Math.max(direct * cfg.discount, floorUsd)
+    : baseUsd * cfg.markup;
   const pricedAt = new Date().toISOString();
 
   const accepts: QuoteLine[] = [];
@@ -62,6 +96,11 @@ export async function quoteRequest(cfg: Config, body: { model?: string; messages
     billedUsd,
     pricedAt,
     accepts,
+    pricing: counterfactual ? "counterfactual" : "markup",
+    directUsd: direct ?? undefined,
+    discount: counterfactual ? cfg.discount : undefined,
+    savesVsDirect: direct ? direct / billedUsd : undefined,
+    flooredAtCost: counterfactual ? direct * cfg.discount < floorUsd : undefined,
   };
 }
 
@@ -79,8 +118,8 @@ export async function spotUsd(cfg: Config, a: Asset): Promise<number> {
   return v;
 }
 
-export async function quoteLive(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }): Promise<Quote> {
-  const q = await quoteRequest(cfg, body);
+export async function quoteLive(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }, counterfactualTokens?: number): Promise<Quote> {
+  const q = await quoteRequest(cfg, body, counterfactualTokens);
   for (const line of q.accepts) {
     const a = cfg.assets.find((x) => x.mint === line.mint);
     if (!a || a.stableUsd) continue;
