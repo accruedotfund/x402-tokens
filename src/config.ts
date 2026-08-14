@@ -28,6 +28,13 @@ export interface Config {
   openrouterUrl: string;
   birdeyeKey: string;
   defaultModel: string;
+  lecoreUrl: string;
+  lecoreKey: string;
+  lecoreTenant: string;
+  lecoreSpillTokens: number;
+  lecoreTopK: number;
+  lecoreTimeoutMs: number;
+  lecoreRequired: boolean;
   assets: Asset[];
 }
 
@@ -73,6 +80,15 @@ export function loadConfig(): Config {
     openrouterUrl: opt("OPENROUTER_URL", "https://openrouter.ai/api/v1").replace(/\/$/, ""),
     birdeyeKey: opt("BIRDEYE_API_KEY", ""),
     defaultModel: opt("DEFAULT_MODEL", "google/gemini-2.5-flash"),
+    // leCore in front: HRR sidecar that spills long bodies before the 402 is
+    // priced. Unset -> plain passthrough, byte-identical to today.
+    lecoreUrl: opt("LECORE_HRR_URL", "").replace(/\/$/, ""),
+    lecoreKey: opt("LECORE_HRR_KEY", ""),
+    lecoreTenant: opt("LECORE_TENANT", "zoo"),
+    lecoreSpillTokens: Number(opt("LECORE_SPILL_TOKENS", "8000")),
+    lecoreTopK: Number(opt("LECORE_TOP_K", "8")),
+    lecoreTimeoutMs: Number(opt("LECORE_TIMEOUT_MS", "10000")),
+    lecoreRequired: opt("LECORE_REQUIRED", "0") === "1",
     assets,
   };
 }
