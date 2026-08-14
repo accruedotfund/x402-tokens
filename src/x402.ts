@@ -17,6 +17,9 @@ export interface Requirements {
     billedUsd: number;
     tokenUsd: number;
     pricedAt: string;
+    /** price API was unreachable; this line rode the last-known spot
+     *  (pricedAt names when that spot was fetched). */
+    priceStale?: boolean;
     /** how this price was formed. "counterfactual" = a DISCOUNT off what
      *  buying this body direct would cost, not a markup on what we forward. */
     pricing: "markup" | "counterfactual";
@@ -45,6 +48,7 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
       billedUsd: a.billedUsd,
       tokenUsd: a.tokenUsd,
       pricedAt: a.pricedAt,
+      priceStale: a.priceStale,
       // Advertising a markup while running a ~29x gross margin is a lie the
       // first time someone counts tokens. State the basis, and only quote a
       // multiplier when a multiplier is actually what formed the price.
@@ -65,7 +69,7 @@ export function challenge(cfg: Config, q: Quote, resource: string, error = "paym
   };
 }
 
-export async function verify(cfg: Config, header: string, reqs: Requirements[]): Promise<{ ok: boolean; reason?: string; picked?: Requirements }> {
+export async function verify(cfg: Config, header: string, reqs: Requirements[]): Promise<{ ok: boolean; reason?: string; picked?: Requirements; payer?: string }> {
   let payload: { network?: string; payload?: unknown };
   try {
     payload = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
@@ -80,8 +84,8 @@ export async function verify(cfg: Config, header: string, reqs: Requirements[]):
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ paymentPayload: payload, paymentRequirements: picked }),
     });
-    const j = (await r.json()) as { isValid?: boolean; invalidReason?: string };
-    return { ok: !!j.isValid, reason: j.invalidReason, picked };
+    const j = (await r.json()) as { isValid?: boolean; invalidReason?: string; payer?: string };
+    return { ok: !!j.isValid, reason: j.invalidReason, picked, payer: j.payer };
   } catch (e) {
     return { ok: false, reason: `facilitator unreachable: ${(e as Error).message.slice(0, 80)}` };
   }

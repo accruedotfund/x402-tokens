@@ -13,6 +13,10 @@ export interface QuoteLine {
   grossRaw: string;
   feeBps: number;
   pricedAt: string;
+  /** true when the price API was down/rate-limited and this line was priced
+   *  from the last known spot (bounded by SPOT_STALE_MAX_MS). pricedAt then
+   *  names when that spot was actually fetched, not now. */
+  priceStale?: boolean;
 }
 
 export interface Quote {
@@ -140,16 +144,52 @@ export async function spotUsd(cfg: Config, a: Asset): Promise<number> {
   return v;
 }
 
+/**
+ * Spot cache + soft-stale fallback. Quoting must survive a rate-limited price
+ * API: MEASURED under load-test, 16 concurrent quotes on a Birdeye-priced
+ * asset 429'd and turned 5/60 quotes into HTTP 500 — the first thing that
+ * breaks at launch traffic, and it takes down quoting for every asset holder.
+ * A meme-coin spot a minute old is a rounding error; a 500 quote is a lost
+ * user. So: fresh within SPOT_TTL_MS, and when the fetch fails, serve the
+ * last-known price up to SPOT_STALE_MAX_MS old (marked priceStale, pricedAt
+ * = when the spot was actually fetched). Past the bound we fail closed,
+ * exactly as before — never price off a price we no longer believe.
+ */
+const spotCache = new Map<string, { at: number; usd: number }>();
+const spotTtlMs = () => Number(process.env.SPOT_TTL_MS || 45_000);
+const spotStaleMaxMs = () => Number(process.env.SPOT_STALE_MAX_MS || 600_000);
+
+/** Test hook. */
+export function _clearSpotCache() { spotCache.clear(); }
+
+export async function spotUsdCached(cfg: Config, a: Asset): Promise<{ usd: number; at: number; stale: boolean }> {
+  const now = Date.now();
+  const hit = spotCache.get(a.mint);
+  if (hit && now - hit.at < spotTtlMs()) return { usd: hit.usd, at: hit.at, stale: false };
+  try {
+    const usd = await spotUsd(cfg, a);
+    spotCache.set(a.mint, { at: now, usd });
+    return { usd, at: now, stale: false };
+  } catch (e) {
+    if (hit && now - hit.at < spotStaleMaxMs()) return { usd: hit.usd, at: hit.at, stale: true };
+    throw e;
+  }
+}
+
 export async function quoteLive(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }, counterfactualTokens?: number): Promise<Quote> {
   const q = await quoteRequest(cfg, body, counterfactualTokens);
   for (const line of q.accepts) {
     const a = cfg.assets.find((x) => x.mint === line.mint);
     if (!a || a.stableUsd) continue;
-    const tokenUsd = await spotUsd(cfg, a);
-    const net = usdToRaw(q.billedUsd, tokenUsd, a.decimals);
-    line.tokenUsd = tokenUsd;
+    const spot = await spotUsdCached(cfg, a);
+    const net = usdToRaw(q.billedUsd, spot.usd, a.decimals);
+    line.tokenUsd = spot.usd;
     line.netRaw = net.toString();
     line.grossRaw = grossUp(net, a.feeBps).toString();
+    if (spot.stale) {
+      line.priceStale = true;
+      line.pricedAt = new Date(spot.at).toISOString();
+    }
   }
   return q;
 }

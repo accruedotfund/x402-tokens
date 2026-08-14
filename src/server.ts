@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync } from "node:fs";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "./config.js";
@@ -25,6 +25,33 @@ const readBody = (req: IncomingMessage) =>
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+
+// ---------------------------------------------------------------------------
+// Observability. One structured "evt" line per chat request — before this,
+// the only log was the settle result, so user acquisition was unmeasurable
+// server-side. Mirrored to /data/usage_events.jsonl when a volume is mounted
+// (none today — Fly log retention is the store until one exists).
+// No PII beyond a truncated payer and a truncated IP.
+const USAGE_FILE = "/data/usage_events.jsonl";
+
+/** First 8 chars of a payer address — enough to count distinct payers, not to dox one. */
+export const shortPayer = (p?: string) => (p ? p.slice(0, 8) : undefined);
+
+/** IPv4 loses its last octet, IPv6 keeps its first three groups. */
+export const shortIp = (ip?: string) => {
+  if (!ip) return undefined;
+  const first = ip.split(",")[0].trim();
+  if (first.includes(".")) return first.split(".").slice(0, 3).join(".") + ".x";
+  return first.split(":").slice(0, 3).join(":") + "::x";
+};
+
+const logEvent = (e: Record<string, unknown>) => {
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...e });
+  console.log("evt", line);
+  if (existsSync("/data")) {
+    try { appendFileSync(USAGE_FILE, line + "\n"); } catch { /* telemetry must never fail a request */ }
+  }
+};
 
 export function createServerFor(cfg: Config) {
   const resource = `${cfg.publicUrl}/v1/chat/completions`;
@@ -100,24 +127,35 @@ export function createServerFor(cfg: Config) {
     // "The body never ships twice": bind a corpus once, then ask with
     // X-HRR-Context on small bodies. Free — see bindPassthrough for why.
     if (req.method === "POST" && url.pathname === "/v1/hrr/bind") {
+      const raw = await readBody(req);
       let body: Record<string, unknown>;
       try {
-        body = JSON.parse((await readBody(req)) || "{}");
+        body = JSON.parse(raw || "{}");
       } catch {
         return json(res, 400, { error: "invalid json" });
       }
       const { status, payload } = await bindPassthrough(cfg, body);
+      logEvent({
+        path: url.pathname,
+        status: "free",
+        bodyBytes: Buffer.byteLength(raw),
+        ip: shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined),
+        http: status,
+      });
       return json(res, status, payload);
     }
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+      const raw = await readBody(req);
       let body: { model?: string; messages?: unknown; max_tokens?: number; stream?: boolean };
       try {
-        body = JSON.parse((await readBody(req)) || "{}");
+        body = JSON.parse(raw || "{}");
       } catch {
         return json(res, 400, { error: "invalid json" });
       }
       if (!body.messages) return json(res, 400, { error: "messages required" });
+      const bodyBytes = Buffer.byteLength(raw);
+      const ip = shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined);
 
       // leCore in front. MUST precede quoteLive: the 402 is priced from
       // estimateTokens(messages), so spilling after the quote would bill the
@@ -173,18 +211,58 @@ export function createServerFor(cfg: Config) {
         lecoreInfo.engaged ? lecoreInfo.tokensBefore : undefined,
       );
       const reqs = requirements(cfg, q, resource);
+      // one analytics line per chat request, whatever the outcome
+      const evt = (status: string, extra: Record<string, unknown> = {}) => logEvent({
+        path: url.pathname,
+        status,
+        model: String(body.model || cfg.defaultModel),
+        bodyBytes,
+        ip,
+        tokens_before: lecoreInfo.tokensBefore,
+        tokens_after: lecoreInfo.tokensAfter,
+        spill_tokens: lecoreInfo.spilledTokens,
+        recalled: lecoreInfo.recalled,
+        corpus_reuse: lecoreInfo.mode === "attach" || undefined,
+        ...extra,
+      });
       const header = req.headers["x-payment"] as string | undefined;
       if (!header) {
+        evt("402_quoted", { billedUsd: q.billedUsd });
         return json(res, 402, challenge(cfg, q, resource), { "x-402-priced-at": q.pricedAt });
       }
       const v = await verify(cfg, header, reqs);
       if (!v.ok || !v.picked) {
+        evt("402_invalid", { reason: (v.reason ?? "invalid payment").slice(0, 200) });
         return json(res, 402, challenge(cfg, q, resource, v.reason ?? "invalid payment"));
       }
 
-      const out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...prepped, stream: false }, cfg.publicUrl);
-      const settled = await settle(cfg, header, v.picked).catch((e) => ({ success: false, errorReason: (e as Error).message }));
+      // SETTLE BEFORE THE UPSTREAM CALL. The old order (serve, then settle)
+      // made every failed settle free inference: 8 "Simulation failed" settles
+      // in the 2026-08-14 logs each shipped a full model response and collected
+      // nothing. It also widened the blockhash window — the payer signs a
+      // recent blockhash, and burning upstream-inference seconds before /settle
+      // pushed slow calls past expiry (the empty-logs simulation failure).
+      // No confirmed settle, no tokens. The trade: a call whose upstream then
+      // errors has already settled — the receipt names the tx so it can be
+      // made right, which beats free inference on every payment that cannot
+      // clear.
+      const settled = (await settle(cfg, header, v.picked).catch((e) => ({ success: false, errorReason: (e as Error).message }))) as
+        { success?: boolean; errorReason?: string; transaction?: string; payer?: string };
       console.log("settle", JSON.stringify(settled));
+      if (!settled.success) {
+        const reason = (settled.errorReason ?? "settle failed").slice(0, 300);
+        evt("failed_settle", { payer: shortPayer(settled.payer ?? v.payer), reason, billedUsd: q.billedUsd });
+        // clean 402, retryable: the client rebuilds (fresh blockhash / topped-up
+        // balance) and pays against the re-quote below.
+        return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt });
+      }
+
+      const out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...prepped, stream: false }, cfg.publicUrl);
+      evt(out.status >= 200 && out.status < 300 ? "paid_200" : "paid_upstream_error", {
+        payer: shortPayer(settled.payer ?? v.payer),
+        upstream: out.status,
+        billedUsd: q.billedUsd,
+      });
       return json(res, out.status, {
         ...(out.json as object),
         x402: {
