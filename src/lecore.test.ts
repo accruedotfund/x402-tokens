@@ -5,7 +5,7 @@ import { prepare } from "./lecore.js";
 import { estimateTokens } from "./math.js";
 import type { Config } from "./config.js";
 
-const base = { lecoreKey: "", lecoreSpillTokens: 500, lecoreTopK: 4, lecoreTimeoutMs: 5000, lecoreRequired: false };
+const base = { lecoreKey: "", lecoreTenant: "zoo", lecoreSpillTokens: 500, lecoreTopK: 4, lecoreTimeoutMs: 5000, lecoreRequired: false };
 const ok = (c: boolean, m: string) => { if (!c) { console.error("FAIL", m); process.exit(1); } console.log("ok -", m); };
 
 const book = Array.from({ length: 60 }, (_, i) =>
@@ -19,8 +19,8 @@ const srv = createServer((req, res) => {
   req.on("end", () => {
     void b;
     res.setHeader("content-type", "application/json");
-    if (req.url === "/v1/hrr/bind") return res.end(JSON.stringify({ context_id: "ctx_TEST" }));
-    if (req.url === "/v1/hrr/recall") return res.end(JSON.stringify({ items: [{ text: "jarett is stacc" }] }));
+    if (req.url === "/internal/v1/hrr/bind") return res.end(JSON.stringify({ context_id: "ctx_TEST" }));
+    if (req.url === "/internal/v1/hrr/recall") return res.end(JSON.stringify({ items: [{ text: "jarett is stacc" }] }));
     res.statusCode = 404; res.end("{}");
   });
 });

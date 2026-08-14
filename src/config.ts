@@ -30,6 +30,7 @@ export interface Config {
   defaultModel: string;
   lecoreUrl: string;
   lecoreKey: string;
+  lecoreTenant: string;
   lecoreSpillTokens: number;
   lecoreTopK: number;
   lecoreTimeoutMs: number;
@@ -83,6 +84,7 @@ export function loadConfig(): Config {
     // priced. Unset -> plain passthrough, byte-identical to today.
     lecoreUrl: opt("LECORE_HRR_URL", "").replace(/\/$/, ""),
     lecoreKey: opt("LECORE_HRR_KEY", ""),
+    lecoreTenant: opt("LECORE_TENANT", "zoo"),
     lecoreSpillTokens: Number(opt("LECORE_SPILL_TOKENS", "8000")),
     lecoreTopK: Number(opt("LECORE_TOP_K", "8")),
     lecoreTimeoutMs: Number(opt("LECORE_TIMEOUT_MS", "10000")),

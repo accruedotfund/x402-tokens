@@ -95,15 +95,15 @@ export async function prepare(
       .filter((it) => it.text.trim().length > 0);
     if (items.length === 0) return off("spill was empty after flattening");
 
-    const bind = (await post(`${cfg.lecoreUrl}/v1/hrr/bind`,
-      { items, ...(thread ? { context_id: thread } : {}) }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { context_id?: string };
+    const bind = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/bind`,
+      { tenant_id: cfg.lecoreTenant, items, ...(thread ? { context_id: thread } : {}) }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { context_id?: string };
     const contextId = bind?.context_id;
     if (!contextId) throw new Error("bind returned no context_id");
 
     // 2. RECALL the slice relevant to the live ask. This is what the user pays for.
     const query = text(live[live.length - 1]?.content) || text(msgs[msgs.length - 1]?.content);
-    const rec = (await post(`${cfg.lecoreUrl}/v1/hrr/recall`,
-      { context_id: contextId, query, top_k: cfg.lecoreTopK }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as
+    const rec = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/recall`,
+      { tenant_id: cfg.lecoreTenant, context_id: contextId, query, top_k: cfg.lecoreTopK }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as
       { items?: Array<{ text?: string }> };
     const slice = (rec?.items ?? []).map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
 
