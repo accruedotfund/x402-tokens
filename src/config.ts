@@ -24,6 +24,8 @@ export interface Config {
   payTo: string;
   feePayer: string;
   markup: number;
+  discount: number;
+  floorMultiple: number;
   openrouterKey: string;
   openrouterUrl: string;
   birdeyeKey: string;
@@ -33,6 +35,9 @@ export interface Config {
   lecoreTenant: string;
   lecoreSpillTokens: number;
   lecoreTopK: number;
+  lecoreTailChars: number;
+  lecoreChunkChars: number;
+  lecoreQueryChars: number;
   lecoreTimeoutMs: number;
   lecoreRequired: boolean;
   assets: Asset[];
@@ -76,6 +81,10 @@ export function loadConfig(): Config {
     payTo: opt("X402_PAY_TO", "WzMaL78srutrF6CsxEkWuhMaDF5HZA6jNRaEPengqpb"),
     feePayer: opt("X402_FEE_PAYER", "WzMaL78srutrF6CsxEkWuhMaDF5HZA6jNRaEPengqpb"),
     markup: Number(opt("X402_MARKUP", "3")),
+    // counterfactual pricing: fraction of what buying this body direct would cost
+    discount: Number(opt("X402_DISCOUNT", "0.5")),
+    // never price under our own forwarded cost x this
+    floorMultiple: Number(opt("X402_FLOOR_MULTIPLE", "1.5")),
     openrouterKey: req("OPENROUTER_API_KEY"),
     openrouterUrl: opt("OPENROUTER_URL", "https://openrouter.ai/api/v1").replace(/\/$/, ""),
     birdeyeKey: opt("BIRDEYE_API_KEY", ""),
@@ -87,6 +96,11 @@ export function loadConfig(): Config {
     lecoreTenant: opt("LECORE_TENANT", "zoo"),
     lecoreSpillTokens: Number(opt("LECORE_SPILL_TOKENS", "8000")),
     lecoreTopK: Number(opt("LECORE_TOP_K", "8")),
+    // tail = the actual ask kept verbatim; chunk = passage size for the head
+    lecoreTailChars: Number(opt("LECORE_TAIL_CHARS", "2000")),
+    lecoreChunkChars: Number(opt("LECORE_CHUNK_CHARS", "1200")),
+    // the retrieval QUERY is the ask alone, not the whole forwarded tail
+    lecoreQueryChars: Number(opt("LECORE_QUERY_CHARS", "400")),
     lecoreTimeoutMs: Number(opt("LECORE_TIMEOUT_MS", "10000")),
     lecoreRequired: opt("LECORE_REQUIRED", "0") === "1",
     assets,

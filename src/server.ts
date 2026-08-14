@@ -122,7 +122,10 @@ export function createServerFor(cfg: Config) {
         return json(res, 503, { error: (e as Error).message });
       }
 
-      const q = await quoteLive(cfg, prepped);
+      // price the counterfactual when leCore engaged: the caller pays a fraction of
+      // what this body would have cost them direct, not a markup on the slice.
+      const q = await quoteLive(cfg, prepped,
+        lecoreInfo.engaged ? lecoreInfo.tokensBefore : undefined);
       const reqs = requirements(cfg, q, resource);
       const header = req.headers["x-payment"] as string | undefined;
       if (!header) {
@@ -140,7 +143,10 @@ export function createServerFor(cfg: Config) {
         ...(out.json as object),
         x402: {
           billedUsd: q.billedUsd,
-          markup: q.markup,
+          pricing: q.pricing,
+          directUsd: q.directUsd,
+          savesVsDirect: q.savesVsDirect,
+          markup: q.pricing === "markup" ? q.markup : undefined,
           paid: v.picked.asset,
           amount: v.picked.maxAmountRequired,
           settle: settled,
