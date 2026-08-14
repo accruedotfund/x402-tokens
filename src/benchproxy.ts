@@ -33,6 +33,7 @@ const cfg = {
   lecoreTailChars: Number(process.env.LECORE_TAIL_CHARS || 2000),
   lecoreChunkChars: Number(process.env.LECORE_CHUNK_CHARS || 1200),
   lecoreQueryChars: Number(process.env.LECORE_QUERY_CHARS || 400),
+  lecoreChunkOverlap: Number(process.env.LECORE_CHUNK_OVERLAP || 300),
   lecoreTimeoutMs: Number(process.env.LECORE_TIMEOUT_MS || 30000),
   lecoreRequired: process.env.LECORE_REQUIRED === "1",
 } as Config;

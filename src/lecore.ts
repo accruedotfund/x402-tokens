@@ -112,10 +112,22 @@ export async function prepare(
     if (body_.length > tailChars * 2) {
       const head = body_.slice(0, body_.length - tailChars);
       const tail = body_.slice(body_.length - tailChars);
+      // OVERLAPPING WINDOWS. Fixed non-overlapping slices silently destroy any
+      // fact that straddles a boundary: MEASURED on a 500k needle at position
+      // 0.02, the 57-char needle line appeared in ZERO of 1,584 chunks
+      // (`needle_chunk=[]`, all 1,584 bound), so retrieval could never have
+      // found it and the miss looked like a ranker failure. It was a chunker
+      // failure. Whether a fact is cut in half depends only on where it lands,
+      // which is why the miss was positional and perfectly reproducible.
+      // An overlap >= the longest fact guarantees every fact is wholly
+      // contained in at least one window.
       const chunk = cfg.lecoreChunkChars;
+      const overlap = Math.min(cfg.lecoreChunkOverlap, Math.floor(chunk / 2));
+      const stride = Math.max(1, chunk - overlap);
       const passages: Msg[] = [];
-      for (let i = 0; i < head.length; i += chunk) {
+      for (let i = 0; i < head.length; i += stride) {
         passages.push({ role: live[lastIdx].role ?? "user", content: head.slice(i, i + chunk) });
+        if (i + chunk >= head.length) break;
       }
       spill = [...live.slice(0, lastIdx), ...passages];
       live = [{ ...live[lastIdx], content: tail }];

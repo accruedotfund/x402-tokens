@@ -45,6 +45,7 @@ export interface Config {
   lecoreTailChars: number;
   lecoreChunkChars: number;
   lecoreQueryChars: number;
+  lecoreChunkOverlap: number;
   lecoreTimeoutMs: number;
   lecoreRequired: boolean;
   assets: Asset[];
@@ -128,6 +129,8 @@ export function loadConfig(): Config {
     lecoreChunkChars: Number(opt("LECORE_CHUNK_CHARS", "1200")),
     // the retrieval QUERY is the ask alone, not the whole forwarded tail
     lecoreQueryChars: Number(opt("LECORE_QUERY_CHARS", "400")),
+    // overlap >= the longest fact you expect, or boundary-straddling facts vanish
+    lecoreChunkOverlap: Number(opt("LECORE_CHUNK_OVERLAP", "300")),
     lecoreTimeoutMs: Number(opt("LECORE_TIMEOUT_MS", "10000")),
     lecoreRequired: opt("LECORE_REQUIRED", "0") === "1",
     assets,
