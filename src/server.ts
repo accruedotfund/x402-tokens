@@ -6,6 +6,7 @@ import { loadConfig, type Config } from "./config.js";
 import { complete, listModels } from "./openrouter.js";
 import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive } from "./quote.js";
+import { prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -105,7 +106,23 @@ export function createServerFor(cfg: Config) {
       }
       if (!body.messages) return json(res, 400, { error: "messages required" });
 
-      const q = await quoteLive(cfg, body);
+      // leCore in front. MUST precede quoteLive: the 402 is priced from
+      // estimateTokens(messages), so spilling after the quote would bill the
+      // caller 3x on the whole book and hand them the discount they already
+      // paid for. Thread key lets a caller keep one holographic context.
+      const thread = (req.headers["x-hrr-context"] as string | undefined)
+        || (typeof (body as { user?: unknown }).user === "string" ? (body as { user: string }).user : undefined);
+      let prepped: Record<string, unknown> = body as Record<string, unknown>;
+      let lecoreInfo: LecoreResult["info"];
+      try {
+        const r = await prepare(cfg, body as Record<string, unknown>, thread);
+        prepped = r.body;
+        lecoreInfo = r.info;
+      } catch (e) {
+        return json(res, 503, { error: (e as Error).message });
+      }
+
+      const q = await quoteLive(cfg, prepped);
       const reqs = requirements(cfg, q, resource);
       const header = req.headers["x-payment"] as string | undefined;
       if (!header) {
@@ -116,7 +133,7 @@ export function createServerFor(cfg: Config) {
         return json(res, 402, challenge(cfg, q, resource, v.reason ?? "invalid payment"));
       }
 
-      const out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...body, stream: false }, cfg.publicUrl);
+      const out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...prepped, stream: false }, cfg.publicUrl);
       const settled = await settle(cfg, header, v.picked).catch((e) => ({ success: false, errorReason: (e as Error).message }));
       console.log("settle", JSON.stringify(settled));
       return json(res, out.status, {
@@ -127,6 +144,7 @@ export function createServerFor(cfg: Config) {
           paid: v.picked.asset,
           amount: v.picked.maxAmountRequired,
           settle: settled,
+          lecore: lecoreInfo,
         },
       });
     }
