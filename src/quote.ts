@@ -77,7 +77,7 @@ export async function quoteRequest(
     accepts.push({
       symbol: a.symbol,
       mint: a.mint,
-      network: cfg.network,
+      network: a.network ?? cfg.network,
       decimals: a.decimals,
       tokenUsd,
       billedUsd,
@@ -104,9 +104,31 @@ export async function quoteRequest(
   };
 }
 
-/** Live USD for a non-stable. Birdeye, fail-closed. */
+/** Live USD from DexScreener, picking the DEEPEST pool. Fail-closed.
+ *
+ *  Deepest, not first: a token can quote on two DEXes at different prices with
+ *  wildly different depth (measured at add time: ROBINHOODS was $0.000005463 on
+ *  a $5,200 uniswap pool and $0.000005531 on a $71 pancakeswap pool). Pricing a
+ *  payment off the $71 pool is pricing off noise. */
+export async function dexScreenerUsd(a: Asset): Promise<number> {
+  const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${a.priceMint}`);
+  if (!r.ok) throw new Error(`dexscreener ${r.status} for ${a.symbol}`);
+  const j = (await r.json()) as { pairs?: Array<{ chainId?: string; priceUsd?: string; liquidity?: { usd?: number } }> };
+  const pools = (j.pairs ?? []).filter(
+    (p) => (!a.priceChain || p.chainId === a.priceChain) && Number(p.priceUsd) > 0,
+  );
+  if (!pools.length) throw new Error(`dexscreener has no ${a.priceChain ?? ""} pool for ${a.symbol}`);
+  pools.sort((x, y) => (y.liquidity?.usd ?? 0) - (x.liquidity?.usd ?? 0));
+  const best = pools[0];
+  const usd = Number(best.priceUsd);
+  if (!(usd > 0)) throw new Error(`dexscreener gave no usable price for ${a.symbol}`);
+  return usd;
+}
+
+/** Live USD for a non-stable. Fail-closed on every source. */
 export async function spotUsd(cfg: Config, a: Asset): Promise<number> {
   if (a.stableUsd) return a.stableUsd;
+  if (a.priceSource === "dexscreener") return dexScreenerUsd(a);
   if (!cfg.birdeyeKey) throw new Error("BIRDEYE_API_KEY required to price " + a.symbol);
   const u = new URL("https://public-api.birdeye.so/defi/price");
   u.searchParams.set("address", a.priceMint);

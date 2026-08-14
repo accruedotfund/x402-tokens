@@ -25,7 +25,11 @@ Every row:
 - network: ${cfg.network}
 - payTo: ${cfg.payTo}
 - feePayer: ${cfg.feePayer}   ← tx feePayer MUST be this. you do not pay SOL.
-- maxAmountRequired: already ${cfg.markup}× OpenRouter USD, in that token's raw units, grossed up for its transfer tax. do not reprice it.
+- maxAmountRequired: the final amount in that token's raw units, grossed up for its transfer tax. do not reprice it.
+- extra.pricing: "counterfactual" = a DISCOUNT off what this exact body would cost you
+  buying direct (extra.directUsd, extra.savesVsDirect). "markup" = small bodies, priced
+  ${cfg.markup}× cost. Long context is cheaper HERE than direct because leCore memory
+  means we never forward the whole body.
 - facilitator: ${cfg.facilitator}
 
 Build one Solana legacy Transaction:
@@ -64,7 +68,7 @@ export function renderIndex(cfg: Config): string {
   return `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>tokens — pay tokens for tokens</title>
-<meta name=description content="OpenRouter behind x402. Inference is 3× USD, paid in ${esc(rails)}, priced at the 402.">
+<meta name=description content="Every model with holographic memory in front. Long context costs HALF of buying direct, paid in ${esc(rails)}, priced at the 402.">
 <link rel=icon href=/token.jpg>
 <style>
 :root{
@@ -150,9 +154,9 @@ footer{color:var(--dim);font-size:.85rem}
 <main>
   <div class=top>
     <div>
-      <div class=kicker>x402 · openrouter · ${esc(cfg.markup)}× usd</div>
+      <div class=kicker>x402 · lecore memory · half of direct</div>
       <h1>pay <em>tokens</em> for tokens</h1>
-      <p class=lede>OpenRouter with no API key. You pay in ${esc(rails)}. Paste the clanker prompt into whatever is holding your keys. The 402 names the exact amount, in USD, at that second, times ${esc(cfg.markup)}.</p>
+      <p class=lede>Every model, with holographic memory in front. Send a book — we spill it into leCore and the model only ever sees the slice that answers you, so long context costs <em>half of buying direct</em>. No API key. You pay in ${esc(rails)}, and the 402 names the exact amount in USD at that second.</p>
       <a class=try href="https://chat.accrue.fund">try it yourself</a>
     </div>
     <img class=coin src=/token.jpg width=256 height=256 alt="TOKEN transit token">
@@ -194,7 +198,7 @@ footer{color:var(--dim);font-size:.85rem}
   <div class=grid>
     <div class=card>
       <h3>Price</h3>
-      <p>OpenRouter's published USD rate for the model, times ${esc(cfg.markup)}. yUSDCx is $1. wTOKENx is Birdeye spot of <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> <em>at the 402</em>. Both wraps take 20bps on transfer — that's the yield.</p>
+      <p>Two bases, and the 402 says which. <b>Long context</b> (leCore engaged): a DISCOUNT off what that exact body would have cost you buying direct — <code>extra.directUsd</code> and <code>extra.savesVsDirect</code> are on the 402, so you can check it. <b>Short bodies</b> (nothing to spill): the published USD rate times ${esc(cfg.markup)}. yUSDCx is $1. wTOKENx is Birdeye spot of <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> <em>at the 402</em>. Both wraps take 20bps on transfer — that's the yield.</p>
     </div>
     <div class=card>
       <h3>What is live today</h3>

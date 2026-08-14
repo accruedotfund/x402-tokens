@@ -4,6 +4,13 @@ export interface Asset {
   symbol: string;
   mint: string;
   decimals: number;
+  /** CAIP-2 network this asset settles on. Defaults to cfg.network (Solana).
+   *  Robinhood Chain is eip155:4663 — assets are no longer all one chain. */
+  network?: string;
+  /** Where spotUsd looks. Birdeye has no Robinhood Chain; DexScreener does. */
+  priceSource?: "birdeye" | "dexscreener";
+  /** DexScreener chain slug, e.g. "robinhood". */
+  priceChain?: string;
   /** Token-2022 transfer-fee basis points (out of 10_000). */
   feeBps: number;
   /**
@@ -38,6 +45,7 @@ export interface Config {
   lecoreTailChars: number;
   lecoreChunkChars: number;
   lecoreQueryChars: number;
+  lecoreChunkOverlap: number;
   lecoreTimeoutMs: number;
   lecoreRequired: boolean;
   assets: Asset[];
@@ -61,6 +69,26 @@ export function loadConfig(): Config {
   };
 
   const assets: Asset[] = [yusdcx];
+
+  // --- Robinhood Chain rails (eip155:4663) --------------------------------
+  // Verified on-chain 2026-08-14 against rpc.mainnet.chain.robinhood.com:
+  // all three are ERC-20, 18 decimals, no transfer fee. Priced by DexScreener
+  // (chain slug "robinhood"); Birdeye does not index this chain.
+  //
+  // ⚠️ THIN LIQUIDITY, and it is why this rail is OPT-IN. At add time the pools
+  // held ODDBALLER $317 / IOU $3,380 / ROBINHOODS $5,200. A quote is only as
+  // real as the depth behind it: taking payment in a token you cannot sell is
+  // taking payment in nothing. RH_RAILS=1 turns them on deliberately.
+  if (opt("RH_RAILS", "0") === "1") {
+    const RH_NETWORK = opt("RH_NETWORK", "eip155:4663");
+    const rh = (symbol: string, mint: string): Asset => ({
+      symbol, mint, decimals: 18, feeBps: 0, priceMint: mint,
+      network: RH_NETWORK, priceSource: "dexscreener", priceChain: opt("RH_CHAIN_SLUG", "robinhood"),
+    });
+    assets.push(rh("ODDBALLER", "0x923eb7BD5B84a1a114CB57212cE2F2e87AE60E2A"));
+    assets.push(rh("IOU", "0xf391999FACbEE613D4024191Dd31060540BF0bEd"));
+    assets.push(rh("ROBINHOODS", "0xC42cF61C16aaC797b991cf9C1ac8Ae70bA74A286"));
+  }
   // Wrapped memecoin is OFF until the mint exists and the facilitator
   // allowlists it. Setting MEME_MINT is what turns the rail on.
   if (process.env.MEME_MINT) {
@@ -101,6 +129,8 @@ export function loadConfig(): Config {
     lecoreChunkChars: Number(opt("LECORE_CHUNK_CHARS", "1200")),
     // the retrieval QUERY is the ask alone, not the whole forwarded tail
     lecoreQueryChars: Number(opt("LECORE_QUERY_CHARS", "400")),
+    // overlap >= the longest fact you expect, or boundary-straddling facts vanish
+    lecoreChunkOverlap: Number(opt("LECORE_CHUNK_OVERLAP", "300")),
     lecoreTimeoutMs: Number(opt("LECORE_TIMEOUT_MS", "10000")),
     lecoreRequired: opt("LECORE_REQUIRED", "0") === "1",
     assets,
