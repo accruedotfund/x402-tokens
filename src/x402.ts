@@ -17,7 +17,12 @@ export interface Requirements {
     billedUsd: number;
     tokenUsd: number;
     pricedAt: string;
-    markup: number;
+    /** how this price was formed. "counterfactual" = a DISCOUNT off what
+     *  buying this body direct would cost, not a markup on what we forward. */
+    pricing: "markup" | "counterfactual";
+    directUsd?: number;
+    savesVsDirect?: number;
+    markup?: number;
   };
 }
 
@@ -29,7 +34,9 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
     maxAmountRequired: a.grossRaw,
     payTo: cfg.payTo,
     resource,
-    description: `OpenRouter ${q.model} × ${cfg.markup} at ${a.pricedAt}`,
+    description: q.pricing === "counterfactual"
+      ? `${q.model} — ${(q.savesVsDirect ?? 1).toFixed(1)}× cheaper than buying direct, at ${a.pricedAt}`
+      : `OpenRouter ${q.model} × ${cfg.markup} at ${a.pricedAt}`,
     maxTimeoutSeconds: 120,
     extra: {
       facilitator: cfg.facilitator,
@@ -38,7 +45,13 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
       billedUsd: a.billedUsd,
       tokenUsd: a.tokenUsd,
       pricedAt: a.pricedAt,
-      markup: cfg.markup,
+      // Advertising a markup while running a ~29x gross margin is a lie the
+      // first time someone counts tokens. State the basis, and only quote a
+      // multiplier when a multiplier is actually what formed the price.
+      pricing: q.pricing,
+      directUsd: q.directUsd,
+      savesVsDirect: q.savesVsDirect,
+      markup: q.pricing === "markup" ? cfg.markup : undefined,
     },
   }));
 }
