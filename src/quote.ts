@@ -185,10 +185,24 @@ export async function spotUsdCached(cfg: Config, a: Asset): Promise<{ usd: numbe
 
 export async function quoteLive(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }, counterfactualTokens?: number): Promise<Quote> {
   const q = await quoteRequest(cfg, body, counterfactualTokens);
+  // An asset with no believable price DROPS OUT of accepts[] rather than
+  // killing the whole 402 or shipping an invented number. One dead pool must
+  // not take down every other rail; equally, a row without a live spot is a
+  // price we made up — never emit it. (Observed: IOU's DexScreener pool
+  // vanished 2026-08-14 — pairs list empty — while ODDBALLER/ROBINHOODS
+  // still quote.)
+  const unpriceable = new Set<string>();
   for (const line of q.accepts) {
     const a = cfg.assets.find((x) => x.mint === line.mint);
     if (!a || a.stableUsd) continue;
-    const spot = await spotUsdCached(cfg, a);
+    let spot;
+    try {
+      spot = await spotUsdCached(cfg, a);
+    } catch (e) {
+      console.error(`quote: dropping ${a.symbol} row — no live price (${(e as Error).message})`);
+      unpriceable.add(line.mint);
+      continue;
+    }
     const net = usdToRaw(q.billedUsd, spot.usd, a.decimals);
     line.tokenUsd = spot.usd;
     line.netRaw = net.toString();
@@ -198,5 +212,6 @@ export async function quoteLive(cfg: Config, body: { model?: string; messages?: 
       line.pricedAt = new Date(spot.at).toISOString();
     }
   }
+  if (unpriceable.size) q.accepts = q.accepts.filter((l) => !unpriceable.has(l.mint));
   return q;
 }

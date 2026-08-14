@@ -156,28 +156,42 @@ export function loadConfig(): Config {
   // real as the depth behind it: taking payment in a token you cannot sell is
   // taking payment in nothing.
   //
-  // ⛔ AND THEY CANNOT SETTLE TODAY. Re-verified on-chain 2026-08-14: all three
-  // answer decimals()==18 and NONE implements authorizationState — i.e. no
-  // EIP-3009. The facilitator's only EVM settle path is
-  // `transferWithAuthorization` (settleExactEvm in x402-anychain/src/evm.ts);
-  // `probeTransferMode` can NAME "permit2" but nothing implements it. They are
-  // also absent from the facilitator's assetsByChainId["4663"] allowlist, so a
-  // payment would be rejected before it ever reached a signature check.
+  // ✅ SETTLEABLE VIA X402WRAPPER TWINS since 2026-08-14. The raw memecoins
+  // have no EIP-3009, so each row settles through its X402Wrapper twin
+  // (repo /Users/stacc/x402-wrappers, deploy record there): an ERC-4626-shaped
+  // vault + EIP-3009 that mirrors wUSDGx exactly (entry 100ppm, exit 100ppm,
+  // transfer fee 200ppm = 2bps deducted from the value, ceil). All three twins
+  // are in the facilitator's assetsByChainId["4663"] allowlist (verified via
+  // GET /supported) and answer authorizationState. EIP-712 domains read live
+  // off each twin: name "Wrapped <SYM> (x402)", version "1", decimals 18
+  // (twins mirror the 18-decimal underlyings).
   //
-  // Emitting them would put three rows in accepts[] that no payer can satisfy
-  // — a rail advertised live that cannot take a payment. So they now sit
-  // behind their OWN flag, separate from RH_RAILS (which carries the wUSDGx
-  // row above and DOES settle). Turning this on requires Permit2 settlement in
-  // the facilitator first.
+  // USER-FACING COPY NAMES ONLY THE UNWRAPPED MEMECOIN (standing directive:
+  // symbol stays ODDBALLER/IOU/ROBINHOODS; the twin mint is plumbing). Priced
+  // by the UNDERLYING's DexScreener pool — the twin has no market of its own,
+  // and NAV >= 1 underlying per share (entry fee accrues to the vault), so the
+  // underlying spot is an honest floor for the share.
+  //
+  // A payer holding only the raw memecoin acquires the twin at payment time:
+  // approve + deposit(uint256,address) — the openzoo shim does this
+  // automatically (lib/wrap.js EVM path), spending the payer's own RH ETH gas.
   if (opt("RH_MEME_RAILS", "0") === "1") {
     const RH_NETWORK = opt("RH_NETWORK", "eip155:4663");
-    const rh = (symbol: string, mint: string): Asset => ({
-      symbol, mint, decimals: 18, feeBps: 0, priceMint: mint,
-      network: RH_NETWORK, priceSource: "dexscreener", priceChain: opt("RH_CHAIN_SLUG", "robinhood"),
+    const rh = (symbol: string, twin: string, underlying: string): Asset => ({
+      symbol, // unwrapped name only — the twin ticker never reaches the user
+      mint: twin,
+      decimals: 18,
+      feeBps: Number(opt("RH_TWIN_FEE_BPS", "2")), // transferFeePpm 200 = 2bps, ceil-safe with grossUp()
+      priceMint: underlying,
+      network: RH_NETWORK,
+      priceSource: "dexscreener",
+      priceChain: opt("RH_CHAIN_SLUG", "robinhood"),
+      payTo: EVM_PAY_TO,
+      eip712: { name: `Wrapped ${symbol} (x402)`, version: "1" },
     });
-    assets.push(rh("ODDBALLER", "0x923eb7BD5B84a1a114CB57212cE2F2e87AE60E2A"));
-    assets.push(rh("IOU", "0xf391999FACbEE613D4024191Dd31060540BF0bEd"));
-    assets.push(rh("ROBINHOODS", "0xC42cF61C16aaC797b991cf9C1ac8Ae70bA74A286"));
+    assets.push(rh("ODDBALLER", opt("RH_WODDBALLERX", "0x1AE410a93C8b05c872D2FE2718e9BB66392AF903"), "0x923eb7BD5B84a1a114CB57212cE2F2e87AE60E2A"));
+    assets.push(rh("IOU", opt("RH_WIOUX", "0x90c2B5DA6097DbbB3632469108A38F4F91eD0434"), "0xf391999FACbEE613D4024191Dd31060540BF0bEd"));
+    assets.push(rh("ROBINHOODS", opt("RH_WROBINHOODSX", "0xD906653C147cF35329161665a4AaaAd3bc118743"), "0xC42cF61C16aaC797b991cf9C1ac8Ae70bA74A286"));
   }
   // Wrapped memecoin is OFF until the mint exists and the facilitator
   // allowlists it. Setting MEME_MINT is what turns the rail on.
