@@ -5,9 +5,13 @@ const esc = (x: unknown) =>
 
 /** What you paste into an agent. Keep it imperative and complete. */
 export function clankerPrompt(cfg: Config): string {
+  const netOf = (a: { network?: string }) => a.network ?? cfg.network;
+  const isEvm = (a: { network?: string }) => netOf(a).startsWith("eip155:");
   const rails = cfg.assets.map((a) =>
-    `- ${a.symbol}  mint ${a.mint}  ${a.feeBps}bps tax  price ${a.stableUsd ? `$${a.stableUsd} stable` : `Birdeye ${a.priceMint} at the 402`}`
+    `- ${a.symbol}  ${isEvm(a) ? "token" : "mint"} ${a.mint}  ${netOf(a)}  decimals ${a.decimals}  ${a.feeBps}bps tax  price ${a.stableUsd ? `$${a.stableUsd} stable` : `${a.priceSource === "dexscreener" ? "DexScreener" : "Birdeye"} ${a.priceMint} at the 402`}`
   ).join("\n");
+  const hasSvm = cfg.assets.some((a) => !isEvm(a));
+  const hasEvm = cfg.assets.some(isEvm);
   return `Use ${cfg.publicUrl} as an OpenAI-compatible inference endpoint. There is no API key.
 
 POST ${cfg.publicUrl}/v1/chat/completions
@@ -21,34 +25,64 @@ You will get HTTP 402. That is the product, not an error.
 accepts[] will include one row per live rail. Pick ONE:
 ${rails}
 
-Every row:
-- network: ${cfg.network}
-- payTo: ${cfg.payTo}
-- feePayer: ${cfg.feePayer}   ← tx feePayer MUST be this. you do not pay SOL.
-- maxAmountRequired: the final amount in that token's raw units, grossed up for its transfer tax. do not reprice it.
+Every row carries its OWN network, payTo and decimals. READ THEM OFF THE ROW —
+they are NOT the same across rails:
+- network: the row's "network" (Solana CAIP-2, or eip155:<chainId>)
+- payTo: the row's "payTo". Solana rows carry a base58 address; eip155 rows
+  carry a 0x address. They are different addresses. Never reuse one for the other.
+- extra.decimals: the raw-unit exponent OF THAT ASSET. It is 6 on some rails and
+  18 on others. Do not assume.
+- maxAmountRequired: the final amount ALREADY in that asset's raw units, grossed
+  up for its transfer tax. Do not reprice it and DO NOT multiply it by
+  10^decimals — that is already done. extra.decimals is for display only.
+- extra.feePayer: Solana rows only.
 - extra.pricing: "counterfactual" = a DISCOUNT off what this exact body would cost you
   buying direct (extra.directUsd, extra.savesVsDirect). "markup" = small bodies, priced
   ${cfg.markup}× cost. Long context is cheaper HERE than direct because leCore memory
   means we never forward the whole body.
 - facilitator: ${cfg.facilitator}
 
-Build one Solana legacy Transaction:
-1. feePayer = ${cfg.feePayer}
-2. exactly one Token-2022 TransferChecked: your ATA of the chosen mint → payTo's ATA, amount = maxAmountRequired, decimals = 6
+${hasSvm ? `IF THE ROW YOU PICKED IS A SOLANA ROW — build one legacy Transaction:
+1. feePayer = the row's extra.feePayer (${cfg.feePayer}) ← you do not pay SOL.
+2. exactly one Token-2022 TransferChecked: your ATA of the chosen mint → payTo's
+   ATA, amount = maxAmountRequired (raw, as given),
+   decimals = the row's extra.decimals ← read it off the row, do not hardcode
 3. you sign as the token owner. leave the feePayer signature empty.
-4. serialize requireAllSignatures=false, base64 that bytes
+4. serialize requireAllSignatures=false, base64 those bytes
 
 X-PAYMENT header = base64 of this JSON (utf8):
-{"x402Version":1,"scheme":"exact","network":"${cfg.network}","payload":{"transaction":"<base64-tx>"}}
+{"x402Version":1,"scheme":"exact","network":"<the row's network>","payload":{"transaction":"<base64-tx>"}}
+` : ""}${hasEvm ? `IF THE ROW YOU PICKED IS AN eip155 ROW — sign EIP-3009, send no transaction:
+1. you pay NO gas. The facilitator relays your signature and pays it.
+2. EIP-712 typed-data sign TransferWithAuthorization with domain
+   {name: extra.name, version: extra.version, chainId: <from eip155:chainId>,
+    verifyingContract: the row's asset}
+   ← name/version come off the ROW. Guessing them recovers a different address
+     and the payment is rejected as "signature does not match payer".
+3. message = {from: <your address>, to: <the row's payTo>,
+              value: maxAmountRequired (raw uint256, VERBATIM — no decimal
+              scaling, this is where an agent loses 10^12),
+              validAfter: 0, validBefore: <now + maxTimeoutSeconds>,
+              nonce: <random 32 bytes, 0x-hex>}
+
+X-PAYMENT header = base64 of this JSON (utf8):
+{"x402Version":1,"scheme":"exact","network":"<the row's network>","payload":{"signature":"0x…","authorization":{"from":"0x…","to":"0x…","value":"<maxAmountRequired>","validAfter":"0","validBefore":"<unix>","nonce":"0x…"}}}
+` : ""}
 
 POST the SAME body again with X-PAYMENT set. Do not change model/messages/max_tokens after the 402 — the quote is for that body.
 
 On 200 you get a normal chat.completion.
 
-Raw TOKEN (EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump) and raw USDC will not settle. Wrap first:
+ON SOLANA, raw TOKEN (EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump) and raw USDC will not settle. Wrap first:
 - USDC → yUSDCx via FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE escrow 2qLm8aCvn6gQVUFeQ7EC5J62Y95gFzc3vReHzD5d5Gj2
 - TOKEN → wTOKENx via the same program, escrow 7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q
 Both wraps are Token-2022 with a 20bps transfer tax. Yield is that tax.
+
+ON BASE there is no wrap step — the row is native Circle USDC, held directly.
+ON ROBINHOOD CHAIN the row is wUSDGx, an ERC-4626 wrapper over Paxos USDG
+(0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168): approve the wrapper, then
+deposit(uint256,address). See ${cfg.facilitator}/start.
+On both eip155 rails you pay no gas — the facilitator relays your signature.
 
 Do not use api.cdp.coinbase.com. This service names ${cfg.facilitator}. GET ${cfg.publicUrl}/.well-known/x402.json and ${cfg.publicUrl}/prompt.txt if you want this text again.`;
 }

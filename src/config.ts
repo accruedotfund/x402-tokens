@@ -14,6 +14,25 @@ export interface Asset {
   /** Token-2022 transfer-fee basis points (out of 10_000). */
   feeBps: number;
   /**
+   * Where THIS asset is paid. A payee address is chain-shaped: the Solana
+   * base58 payTo is not a valid `to` for an EIP-3009 authorization, and an
+   * EVM row carrying it makes every Base/RH payment unsignable. Defaults to
+   * cfg.payTo (Solana) when unset.
+   */
+  payTo?: string;
+  /**
+   * EIP-712 domain for EVM assets. The payer signs
+   * `TransferWithAuthorization` against `{name, version, chainId,
+   * verifyingContract}`; the facilitator recovers with the domain it reads
+   * off the token. A guessed name/version recovers a DIFFERENT address and
+   * the payment is rejected as "signature does not match payer".
+   *
+   * Read from chain, never assumed:
+   *   Base USDC  -> name "USD Coin",           version "2"
+   *   RH wUSDGx  -> name "Wrapped USDG (x402)", version "1"
+   */
+  eip712?: { name: string; version: string };
+  /**
    * Mint Birdeye should price. For yUSDCx this is USDC (NAV ≈ $1).
    * For the memecoin wrap this is the underlying pump mint — the wrap
    * usually has no market of its own.
@@ -29,6 +48,9 @@ export interface Config {
   facilitator: string;
   network: string;
   payTo: string;
+  /** Payee for every eip155 row. Separate from `payTo` because that one is a
+   *  Solana base58 address and cannot receive an ERC-20 transfer. */
+  evmPayTo: string;
   feePayer: string;
   markup: number;
   discount: number;
@@ -70,7 +92,61 @@ export function loadConfig(): Config {
 
   const assets: Asset[] = [yusdcx];
 
+  // Payee for eip155 rows. Verified against the operator's own prior x402
+  // settlement on eip155:4663 (themes.oddballer.fun, 2026-08-11).
+  const EVM_PAY_TO = opt("X402_PAY_TO_EVM", "0x3C4ec546e47471321aED2956925E9f0942beB260");
+
+  // --- Base rail (eip155:8453) --------------------------------------------
+  // Native Circle USDC. Every precondition for settlement verified on-chain
+  // 2026-08-14 rather than assumed:
+  //   - EIP-3009: authorizationState(...) answers, so the facilitator's
+  //     transferWithAuthorization path applies (its ONLY EVM settle path).
+  //   - EIP-712 domain: name "USD Coin", version "2", decimals 6, read live.
+  //   - Facilitator allowlists it (GET /supported, eip155:8453) and its gas
+  //     signer 0xEA55E489a825319Fad7A537F31d661d391696cC4 held 0.009 ETH on
+  //     Base, ready:true.
+  // No NAV twin here on purpose: the pricing path only needs `decimals` and a
+  // USD figure, so a plain stable prices exactly like yUSDCx does. The payer
+  // signs; the facilitator pays the gas.
+  if (opt("BASE_RAILS", "0") === "1") {
+    assets.push({
+      symbol: "USDC",
+      mint: opt("BASE_USDC", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+      decimals: 6,
+      feeBps: 0, // native USDC has no transfer fee
+      priceMint: opt("BASE_USDC", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+      stableUsd: 1,
+      network: opt("BASE_NETWORK", "eip155:8453"),
+      payTo: EVM_PAY_TO,
+      eip712: { name: "USD Coin", version: "2" },
+    });
+  }
+
   // --- Robinhood Chain rails (eip155:4663) --------------------------------
+  // wUSDGx is the ONLY asset on this chain the facilitator can actually
+  // settle: verified on-chain 2026-08-14, it is 6-decimal and answers
+  // authorizationState (EIP-3009), and it is in the facilitator's
+  // assetsByChainId["4663"] allowlist. Domain read live: name
+  // "Wrapped USDG (x402)", version "1". RH gas signer was funded and ready.
+  //
+  // Priced as a $1 stable: it is a NAV-up ERC-4626 wrapper over Paxos USDG,
+  // so a share is worth >= $1 of USDG. Underlying is USDG in all user-facing
+  // copy; the wrapper ticker is plumbing.
+  if (opt("RH_RAILS", "0") === "1") {
+    assets.push({
+      symbol: "wUSDGx",
+      mint: opt("RH_WUSDGX", "0x9bdD78296f758af1b048E14E101c90Daa511ADC5"),
+      decimals: 6,
+      feeBps: Number(opt("RH_WUSDGX_FEE_BPS", "20")), // transferFeePpm 200
+      priceMint: opt("RH_WUSDGX", "0x9bdD78296f758af1b048E14E101c90Daa511ADC5"),
+      stableUsd: 1,
+      network: opt("RH_NETWORK", "eip155:4663"),
+      payTo: EVM_PAY_TO,
+      eip712: { name: "Wrapped USDG (x402)", version: "1" },
+    });
+  }
+
+  // --- Robinhood Chain MEMECOIN rails (eip155:4663) -----------------------
   // Verified on-chain 2026-08-14 against rpc.mainnet.chain.robinhood.com:
   // all three are ERC-20, 18 decimals, no transfer fee. Priced by DexScreener
   // (chain slug "robinhood"); Birdeye does not index this chain.
@@ -78,8 +154,22 @@ export function loadConfig(): Config {
   // ⚠️ THIN LIQUIDITY, and it is why this rail is OPT-IN. At add time the pools
   // held ODDBALLER $317 / IOU $3,380 / ROBINHOODS $5,200. A quote is only as
   // real as the depth behind it: taking payment in a token you cannot sell is
-  // taking payment in nothing. RH_RAILS=1 turns them on deliberately.
-  if (opt("RH_RAILS", "0") === "1") {
+  // taking payment in nothing.
+  //
+  // ⛔ AND THEY CANNOT SETTLE TODAY. Re-verified on-chain 2026-08-14: all three
+  // answer decimals()==18 and NONE implements authorizationState — i.e. no
+  // EIP-3009. The facilitator's only EVM settle path is
+  // `transferWithAuthorization` (settleExactEvm in x402-anychain/src/evm.ts);
+  // `probeTransferMode` can NAME "permit2" but nothing implements it. They are
+  // also absent from the facilitator's assetsByChainId["4663"] allowlist, so a
+  // payment would be rejected before it ever reached a signature check.
+  //
+  // Emitting them would put three rows in accepts[] that no payer can satisfy
+  // — a rail advertised live that cannot take a payment. So they now sit
+  // behind their OWN flag, separate from RH_RAILS (which carries the wUSDGx
+  // row above and DOES settle). Turning this on requires Permit2 settlement in
+  // the facilitator first.
+  if (opt("RH_MEME_RAILS", "0") === "1") {
     const RH_NETWORK = opt("RH_NETWORK", "eip155:4663");
     const rh = (symbol: string, mint: string): Asset => ({
       symbol, mint, decimals: 18, feeBps: 0, priceMint: mint,
@@ -107,6 +197,7 @@ export function loadConfig(): Config {
     facilitator: opt("X402_FACILITATOR", "https://x402.accrue.fund").replace(/\/$/, ""),
     network: opt("X402_NETWORK", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
     payTo: opt("X402_PAY_TO", "WzMaL78srutrF6CsxEkWuhMaDF5HZA6jNRaEPengqpb"),
+    evmPayTo: EVM_PAY_TO,
     feePayer: opt("X402_FEE_PAYER", "WzMaL78srutrF6CsxEkWuhMaDF5HZA6jNRaEPengqpb"),
     markup: Number(opt("X402_MARKUP", "3")),
     // counterfactual pricing: fraction of what buying this body direct would cost

@@ -12,8 +12,22 @@ export interface Requirements {
   maxTimeoutSeconds: number;
   extra: {
     facilitator: string;
-    feePayer: string;
+    /** Solana only — the SVM fee payer. Omitted on eip155 rows, where the
+     *  facilitator's own gas signer pays and a base58 key here is nonsense. */
+    feePayer?: string;
     symbol: string;
+    /**
+     * Raw-unit exponent for `asset`. Always present so a client NEVER has to
+     * assume: the rails span 6-decimal (Solana wraps, Base USDC, wUSDGx) and
+     * 18-decimal assets, and assuming 6 on an 18-decimal token underpays by
+     * 10^12. `maxAmountRequired` is already in raw units — this is for display
+     * and for sanity-checking, not for rescaling it.
+     */
+    decimals: number;
+    /** EIP-712 domain for eip155 rows: what the payer must sign
+     *  `TransferWithAuthorization` against. Omitted on Solana rows. */
+    name?: string;
+    version?: string;
     billedUsd: number;
     tokenUsd: number;
     pricedAt: string;
@@ -30,12 +44,16 @@ export interface Requirements {
 }
 
 export function requirements(cfg: Config, q: Quote, resource: string): Requirements[] {
-  return q.accepts.map((a) => ({
+  return q.accepts.map((a) => {
+    const isEvm = a.network.startsWith("eip155:");
+    return {
     scheme: "exact" as const,
     network: a.network,
     asset: a.mint,
     maxAmountRequired: a.grossRaw,
-    payTo: cfg.payTo,
+    // Chain-shaped payee. Sending the Solana base58 address on an eip155 row
+    // makes the EIP-3009 `to` unparseable and every Base/RH payment unsignable.
+    payTo: a.payTo ?? cfg.payTo,
     resource,
     description: q.pricing === "counterfactual"
       ? `${q.model} — ${(q.savesVsDirect ?? 1).toFixed(1)}× cheaper than buying direct, at ${a.pricedAt}`
@@ -43,8 +61,11 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
     maxTimeoutSeconds: 120,
     extra: {
       facilitator: cfg.facilitator,
-      feePayer: cfg.feePayer,
+      feePayer: isEvm ? undefined : cfg.feePayer,
       symbol: a.symbol,
+      decimals: a.decimals,
+      name: isEvm ? a.eip712?.name : undefined,
+      version: isEvm ? a.eip712?.version : undefined,
       billedUsd: a.billedUsd,
       tokenUsd: a.tokenUsd,
       pricedAt: a.pricedAt,
@@ -57,7 +78,8 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
       savesVsDirect: q.savesVsDirect,
       markup: q.pricing === "markup" ? cfg.markup : undefined,
     },
-  }));
+  };
+  });
 }
 
 export function challenge(cfg: Config, q: Quote, resource: string, error = "payment required") {
@@ -65,8 +87,29 @@ export function challenge(cfg: Config, q: Quote, resource: string, error = "paym
     x402Version: 1,
     accepts: requirements(cfg, q, resource),
     error,
-    help: `Don't hold yUSDCx yet? ${cfg.facilitator}/start — or wrap USDC. This is 3× OpenRouter, priced at this 402.`,
+    // Name UNDERLYING assets, never the wrapper tickers — those are internal
+    // plumbing. Derived from the live rails so it cannot drift out of date.
+    help: `Pay in ${underlyingNames(cfg)}. Don't hold any yet? ${cfg.facilitator}/start. Each accepts[] row carries extra.decimals — maxAmountRequired is already in that asset's raw units, do not rescale it.`,
   };
+}
+
+/** Underlying assets behind the live rails, deduped, in offer order. */
+export function underlyingNames(cfg: Config): string {
+  const seen = new Set<string>();
+  for (const a of cfg.assets) {
+    const net = a.network ?? cfg.network;
+    const chain = net.startsWith("solana:") ? "Solana"
+      : net === "eip155:8453" ? "Base"
+      : net === "eip155:4663" ? "Robinhood Chain"
+      : net;
+    // wrapper ticker -> what the holder actually brought
+    const under = /^yUSDCx$/.test(a.symbol) ? "USDC"
+      : /^wUSDGx$/.test(a.symbol) ? "USDG"
+      : /^wTOKENx$/.test(a.symbol) ? "TOKEN"
+      : a.symbol;
+    seen.add(`${under} on ${chain}`);
+  }
+  return [...seen].join(", ");
 }
 
 export async function verify(cfg: Config, header: string, reqs: Requirements[]): Promise<{ ok: boolean; reason?: string; picked?: Requirements; payer?: string }> {

@@ -13,6 +13,11 @@ export interface QuoteLine {
   grossRaw: string;
   feeBps: number;
   pricedAt: string;
+  /** Chain-correct payee for this row (EVM rows cannot use the Solana payTo). */
+  payTo?: string;
+  /** EIP-712 domain for EVM rows, so the payer signs the domain the
+   *  facilitator will recover against. */
+  eip712?: { name: string; version: string };
   /** true when the price API was down/rate-limited and this line was priced
    *  from the last known spot (bounded by SPOT_STALE_MAX_MS). pricedAt then
    *  names when that spot was actually fetched, not now. */
@@ -89,6 +94,8 @@ export async function quoteRequest(
       grossRaw: gross.toString(),
       feeBps: a.feeBps,
       pricedAt,
+      payTo: a.payTo,
+      eip712: a.eip712,
     });
   }
   return {
