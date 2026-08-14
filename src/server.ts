@@ -124,8 +124,22 @@ export function createServerFor(cfg: Config) {
 
       // price the counterfactual when leCore engaged: the caller pays a fraction of
       // what this body would have cost them direct, not a markup on the slice.
-      const q = await quoteLive(cfg, prepped,
-        lecoreInfo.engaged ? lecoreInfo.tokensBefore : undefined);
+      //
+      // FAIL-OPEN MUST NOT BILL A MARKUP. If the sidecar times out on a fat body
+      // we forward the whole thing — and the markup path would then charge
+      // X402_MARKUP x the UNSPILLED cost, i.e. ~6x what buying direct costs, for
+      // a call where our memory did nothing. MEASURED: a 967,288-token body
+      // failed open at the 120s timeout. When leCore was supposed to engage and
+      // didn't, price at direct (markup 1) — we still cover cost, and we never
+      // punish a caller for our own outage.
+      const shouldHaveEngaged = Boolean(cfg.lecoreUrl)
+        && !lecoreInfo.engaged
+        && String(lecoreInfo.reason || "").startsWith("fail-open");
+      const q = await quoteLive(
+        shouldHaveEngaged ? { ...cfg, markup: 1 } : cfg,
+        prepped,
+        lecoreInfo.engaged ? lecoreInfo.tokensBefore : undefined,
+      );
       const reqs = requirements(cfg, q, resource);
       const header = req.headers["x-payment"] as string | undefined;
       if (!header) {
