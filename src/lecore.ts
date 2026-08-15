@@ -504,9 +504,24 @@ export async function lecoreCall(
   op: "find" | "describe" | "invoke",
   body: Record<string, unknown>,
 ): Promise<{ status: number; payload: Record<string, unknown> }> {
-  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
-  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/lecore/${op}`,
-    { tenant_id: cfg.lecoreTenant, ...body }, cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  // AGAINST lecore-front, NOT the HRR sidecar. The sidecar deliberately imports
+  // only four leCore modules; building the full faculty surface next to
+  // bind/recall OOM'd it mid-bind on 20MB chunks (see hrr-context _lecore.py).
+  // leCore's own service already exposes /tools + /invoke on its own app, so
+  // discovery and heavy faculties run there and cannot starve retrieval.
+  if (!cfg.lecoreFrontUrl) return { status: 503, payload: { error: "lecore_unconfigured: LECORE_FRONT_URL unset" } };
+  const path = op === "invoke" ? "/invoke" : "/tools";
+  const payload = op === "invoke"
+    ? { name: body.name, args: body.args || {} }
+    : { query: body.query ?? body.name, top: body.top ?? 8 };
+  // SHORT, SEPARATE TIMEOUT. lecore-front builds its faculty catalog on demand
+  // and an authed /tools has been measured not answering inside 300s, with no
+  // request line logged (FastAPI logs on completion) — i.e. still grinding.
+  // Inheriting the sidecar's generous timeout would hang a caller for minutes
+  // on a discovery call; a fast, honest failure is strictly better than that.
+  const frontMs = Number(process.env.LECORE_FRONT_TIMEOUT_MS || 8000);
+  const { status, json } = await postRaw(`${cfg.lecoreFrontUrl}${path}`,
+    payload, frontMs, cfg.lecoreFrontKey);
   if (status < 200 || status >= 300) {
     const j = json as { error?: string; code?: string };
     return { status, payload: { error: j?.error || `lecore_${op} -> ${status}`, code: j?.code } };

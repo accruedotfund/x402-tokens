@@ -63,6 +63,12 @@ export interface Config {
   lecoreKey: string;
   lecoreTenant: string;
   lecoreSpillTokens: number;
+  /** leCore's OWN service (/tools + /invoke) — a SEPARATE app from the HRR
+   *  sidecar on purpose: constructing the full faculty surface pulls ~510
+   *  faculties and has OOM'd the sidecar mid-bind on 20MB chunks. Discovery
+   *  and invoke must never share a process with bind/recall. */
+  lecoreFrontUrl: string;
+  lecoreFrontKey: string;
   lecoreTopK: number;
   /** Chunks in the referenced context, learned at bind time. Drives the
    *  coverage note; undefined = unknown, which the note handles. */
@@ -231,6 +237,8 @@ export function loadConfig(): Config {
     lecoreKey: opt("LECORE_HRR_KEY", ""),
     lecoreTenant: opt("LECORE_TENANT", "zoo"),
     lecoreSpillTokens: Number(opt("LECORE_SPILL_TOKENS", "8000")),
+    lecoreFrontUrl: opt("LECORE_FRONT_URL", "https://lecore-front.fly.dev").replace(/\/$/, ""),
+    lecoreFrontKey: opt("LECORE_FRONT_KEY", ""),
     lecoreTopK: Number(opt("LECORE_TOP_K", "8")),
     // tail = the actual ask kept verbatim; chunk = passage size for the head
     lecoreTailChars: Number(opt("LECORE_TAIL_CHARS", "2000")),
