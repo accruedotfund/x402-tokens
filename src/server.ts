@@ -524,7 +524,38 @@ export function createServerFor(cfg: Config) {
         return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt });
       }
 
-      const out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...prepped, stream: false }, cfg.publicUrl);
+      let out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...prepped, stream: false }, cfg.publicUrl);
+
+      // PAID-FOR-SILENCE GUARD. A reasoning model can spend the WHOLE
+      // max_tokens budget on hidden reasoning and get truncated before it
+      // emits one visible character. REPRODUCED: google/gemini-3.7-flash,
+      // max_tokens=20, prompt "Reply with exactly the word ALIVE" ->
+      // content:"" finish_reason:"length" completion_tokens:17 with 251 chars
+      // of reasoning; at max_tokens=200 the same call answers "ALIVE". Users
+      // saw ~1/3 of calls come back empty, each one billed (one liveness probe
+      // cost $0.039 and returned nothing).
+      //
+      // We settle BEFORE the upstream call, on purpose (see above), so the
+      // money is already taken and a refund is not on the table. The honest
+      // remedy is to deliver what was paid for: retry ONCE with real headroom
+      // and eat the extra upstream cost ourselves. Only on the exact signature
+      // -- empty content AND finish_reason "length" -- so a legitimately empty
+      // answer or a stop-finished one is never re-run.
+      const emptyTruncated = (r: { status: number; json?: unknown }) => {
+        if (r.status < 200 || r.status >= 300) return false;
+        const ch = ((r.json as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> })
+          ?.choices ?? [])[0];
+        return !!ch && ch.finish_reason === "length" && !(ch.message?.content || "").trim();
+      };
+      if (emptyTruncated(out)) {
+        const asked = Number((prepped as { max_tokens?: number }).max_tokens ?? 256);
+        const roomier = Math.min(Math.max(asked * 4, 512), 4096);
+        console.log("retry", JSON.stringify({ reason: "empty_truncated", asked, roomier }));
+        const retry = await complete(cfg.openrouterUrl, cfg.openrouterKey,
+          { ...prepped, stream: false, max_tokens: roomier }, cfg.publicUrl);
+        if (!emptyTruncated(retry) && retry.status >= 200 && retry.status < 300) out = retry;
+      }
+
       evt(out.status >= 200 && out.status < 300 ? "paid_200" : "paid_upstream_error", {
         payer: settled.payer ?? v.payer,
         upstream: out.status,

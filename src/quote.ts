@@ -73,9 +73,23 @@ export async function quoteRequest(
     : null;
   const counterfactual = direct !== null && cfg.discount > 0;
   const floorUsd = baseUsd * cfg.floorMultiple;
+  // NO CLIFF. The two modes used to be exclusive, which made price
+  // NON-MONOTONIC in body size: MEASURED on the live gateway, 40,000 chars
+  // billed $0.096426 (markup) while 42,000 chars billed $0.047421
+  // (counterfactual) — sending MORE data cost HALF. That is not just ugly, it
+  // is exploitable: the rational move is to pad every body past the spill
+  // threshold, which wastes the caller's bandwidth and OUR upstream tokens to
+  // buy a discount. It also punishes exactly the careful user who trims their
+  // prompt.
+  //
+  // So the markup is a CEILING, never a cliff: whenever a counterfactual price
+  // exists, the caller pays the lower of the two. Below the spill threshold
+  // nothing changes (there is no counterfactual to compare against), and above
+  // it nobody can game a discount by inflating a body.
+  const markupUsd = baseUsd * cfg.markup;
   const billedUsd = counterfactual
-    ? Math.max(direct * cfg.discount, floorUsd)
-    : baseUsd * cfg.markup;
+    ? Math.min(Math.max(direct * cfg.discount, floorUsd), markupUsd)
+    : markupUsd;
   const pricedAt = new Date().toISOString();
 
   const accepts: QuoteLine[] = [];
