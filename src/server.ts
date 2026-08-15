@@ -65,12 +65,13 @@ async function withTenantFallback<T>(
   cfg: Config,
   req: IncomingMessage,
   fn: (c: Config) => Promise<T>,
+  ctxHint?: string,
 ): Promise<T> {
   const tenants = tenantCandidates(cfg, req);
   let last: unknown;
   for (let i = 0; i < tenants.length; i++) {
     try {
-      return await fn({ ...cfg, lecoreTenant: tenants[i], lecoreTopK: topKFor(cfg, req) });
+      return await fn({ ...cfg, lecoreTenant: tenants[i], lecoreTopK: topKFor(cfg, req, ctxHint) });
     } catch (e) {
       last = e;
       // ContextGoneError here means "not in THIS tenant", which is exactly the
@@ -93,10 +94,45 @@ async function withTenantFallback<T>(
  * never saw it. Callers that know they want breadth can now say so, bounded
  * so nobody can ask for the whole corpus and blow the bill up.
  */
-function topKFor(cfg: Config, req: IncomingMessage): number {
+/** Ceiling for an EXPLICIT X-HRR-Top-K. */
+const TOP_K_MAX = 256;
+/** Ceiling for AUTOMATIC widening — deliberately lower than the explicit one.
+ *  Every chunk is billed prompt tokens, so the default must never surprise
+ *  someone with a dollar-a-question bill; asking for more is opt-in. */
+const TOP_K_AUTO_MAX = 96;
+/** Chunks bound per context, learned at bind time. Bounded, in-memory, and
+ *  per-machine — a miss just means the default, never an error. */
+const contextChunks = new Map<string, number>();
+function rememberChunks(contextId: string | undefined, bound: number | undefined) {
+  if (!contextId || !Number.isFinite(bound as number)) return;
+  contextChunks.set(contextId, (contextChunks.get(contextId) ?? 0) + (bound as number));
+  if (contextChunks.size > 5000) contextChunks.delete(contextChunks.keys().next().value as string);
+}
+
+/**
+ * Retrieval breadth SCALED TO THE CORPUS.
+ *
+ * A fixed top_k is wrong at both ends: 16 chunks is plenty for a 50-chunk
+ * corpus and hopeless for a 7,000-chunk one. MEASURED on an 8.7MB Telegram
+ * export, top_k=16 put ~19KB of 8.7MB in front of the model and an agent's
+ * grep found pump.fun and Solana evidence retrieval had never surfaced.
+ *
+ * Scales with log2 of corpus size, not linearly: retrieval quality per extra
+ * chunk falls off fast, and every chunk is billed prompt tokens, so doubling
+ * the corpus should widen the net a little, not double the bill. A caller can
+ * always override with X-HRR-Top-K, which wins over everything.
+ */
+function scaleTopK(base: number, chunks: number): number {
+  if (!Number.isFinite(chunks) || chunks <= base) return base;
+  const widened = Math.round(base * (1 + Math.log2(chunks / base) / 2));
+  return Math.min(Math.max(widened, base), TOP_K_AUTO_MAX);
+}
+
+function topKFor(cfg: Config, req: IncomingMessage, contextId?: string): number {
   const raw = Number(req.headers["x-hrr-top-k"]);
-  if (!Number.isFinite(raw)) return cfg.lecoreTopK;
-  return Math.min(Math.max(Math.floor(raw), 1), 256);
+  if (Number.isFinite(raw)) return Math.min(Math.max(Math.floor(raw), 1), TOP_K_MAX);
+  const known = contextId ? contextChunks.get(contextId) : undefined;
+  return known ? scaleTopK(cfg.lecoreTopK, known) : cfg.lecoreTopK;
 }
 
 const CLIENT_USABLE_CONTEXT = 128_000_000;
@@ -308,6 +344,9 @@ export function createServerFor(cfg: Config) {
         return json(res, 400, { error: "invalid json" });
       }
       const { status, payload } = await bindPassthrough({ ...cfg, lecoreTenant: tenantFor(cfg, req) }, body);
+      // Learn the corpus size so later asks against this context scale their
+      // retrieval breadth to it (see scaleTopK).
+      rememberChunks((payload as { context_id?: string }).context_id, (payload as { bound?: number }).bound);
       logEvent({
         path: url.pathname,
         status: "free",
@@ -341,7 +380,7 @@ export function createServerFor(cfg: Config) {
       let lecoreInfo: LecoreResult["info"];
       try {
         const r = thread
-          ? await withTenantFallback(cfg, req, (c) => prepare(c, body as Record<string, unknown>, thread))
+          ? await withTenantFallback(cfg, req, (c) => prepare(c, body as Record<string, unknown>, thread), thread)
           : await prepare({ ...cfg, lecoreTenant: tenantFor(cfg, req), lecoreTopK: topKFor(cfg, req) }, body as Record<string, unknown>, thread);
         prepped = r.body;
         lecoreInfo = r.info;
@@ -356,7 +395,7 @@ export function createServerFor(cfg: Config) {
       // A dead context 404s BEFORE the 402 so a stale manifest re-binds free.
       if (headerCtx && !lecoreInfo.engaged && cfg.lecoreUrl) {
         try {
-          const a = await withTenantFallback(cfg, req, (c) => attach(c, prepped, headerCtx));
+          const a = await withTenantFallback(cfg, req, (c) => attach(c, prepped, headerCtx), headerCtx);
           prepped = a.body;
           lecoreInfo = a.info;
         } catch (e) {
