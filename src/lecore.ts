@@ -207,8 +207,24 @@ export async function prepare(
       const MARK = " … [older turn — full text in the retrieved context above]";
       const shrunk = oldMsgs.map((m) => {
         const t = text(m.content);
-        if (typeof m.content !== "string" || t.length <= SHRINK_OVER) return m; // envelope kept as-is
-        return { ...m, content: t.slice(0, HEAD) + MARK };                      // id/role preserved, content shrunk
+        if (t.length <= SHRINK_OVER) return m; // small enough, leave alone
+        // ARRAY CONTENT MUST SHRINK TOO. Anthropic-shaped bodies carry tool
+        // results as content BLOCKS, not strings — an earlier version only
+        // shrank strings, so every tool_result was skipped and the request
+        // GREW (recalled slice added, nothing removed): measured 14,856 ->
+        // 14,899. Shrink the text INSIDE each block and keep the block's
+        // type/tool_use_id, so the provider's correlation is still intact.
+        if (Array.isArray(m.content)) {
+          const blocks = (m.content as Array<Record<string, unknown>>).map((b) => {
+            const bt = typeof b?.text === "string" ? (b.text as string)
+              : typeof b?.content === "string" ? (b.content as string) : null;
+            if (bt === null || bt.length <= SHRINK_OVER) return b;
+            const short = bt.slice(0, HEAD) + MARK;
+            return typeof b.text === "string" ? { ...b, text: short } : { ...b, content: short };
+          });
+          return { ...m, content: blocks };
+        }
+        return { ...m, content: t.slice(0, HEAD) + MARK }; // plain string
       });
       const tail = msgs.slice(cut);
       const rebuilt: Msg[] = slice

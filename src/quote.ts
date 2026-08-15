@@ -139,11 +139,28 @@ export async function dexScreenerUsd(a: Asset): Promise<number> {
 /** Live USD for a non-stable. Fail-closed on every source. */
 export async function spotUsd(cfg: Config, a: Asset): Promise<number> {
   if (a.stableUsd) return a.stableUsd;
-  if (a.priceSource === "dexscreener") return dexScreenerUsd(a);
+  if (a.priceSource === "dexscreener") {
+    try {
+      return await dexScreenerUsd(a);
+    } catch (e) {
+      // FALL BACK, don't fail closed on one aggregator's coverage gap. A token
+      // with no DexScreener pool is not a token with no price: IOU lost its
+      // pool and its row vanished from every 402, while Birdeye still quoted
+      // it. Only a token BOTH sources refuse is genuinely unpriceable.
+      if (!cfg.birdeyeKey) throw e;
+      console.error(`quote: ${a.symbol} dexscreener miss (${(e as Error).message}) — trying birdeye`);
+    }
+  }
   if (!cfg.birdeyeKey) throw new Error("BIRDEYE_API_KEY required to price " + a.symbol);
   const u = new URL("https://public-api.birdeye.so/defi/price");
   u.searchParams.set("address", a.priceMint);
-  const r = await fetch(u, { headers: { "X-API-KEY": cfg.birdeyeKey, "x-chain": "solana" } });
+  // CHAIN COMES FROM THE ASSET. This was hardcoded to "solana", which meant a
+  // non-Solana asset could never be priced by Birdeye no matter what its
+  // priceSource said — IOU on Robinhood Chain silently had no usable source and
+  // its row was dropped from every live 402.
+  const r = await fetch(u, {
+    headers: { "X-API-KEY": cfg.birdeyeKey, "x-chain": a.priceChain ?? "solana" },
+  });
   if (!r.ok) throw new Error(`birdeye ${r.status}`);
   const j = (await r.json()) as { success?: boolean; data?: { value?: number } };
   const v = j.data?.value;

@@ -379,8 +379,16 @@ export function createServerFor(cfg: Config) {
       // caller 3x on the whole book and hand them the discount they already
       // paid for. Thread key lets a caller keep one holographic context.
       const headerCtx = req.headers["x-hrr-context"] as string | undefined;
-      const thread = headerCtx
-        || (typeof (body as { user?: unknown }).user === "string" ? (body as { user: string }).user : undefined);
+      // body.user is a stock OpenAI field: grok and Claude Code set it to a
+      // username / uuid, NOT a context id. Feeding that to the spill bind as a
+      // context_id makes the sidecar reject the append with 400 (invalid
+      // context_id format), spill fails open, and the whole body ships
+      // unspilled at full price — MEASURED: 45k-token bodies billed unspilled.
+      // Only accept it as a thread key if it is actually one of our ids.
+      const userThread = typeof (body as { user?: unknown }).user === "string"
+        ? (body as { user: string }).user
+        : undefined;
+      const thread = headerCtx || (userThread?.startsWith("ctx_") ? userThread : undefined);
       let prepped: Record<string, unknown> = body as Record<string, unknown>;
       let lecoreInfo: LecoreResult["info"];
       try {
