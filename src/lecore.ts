@@ -416,3 +416,44 @@ export async function bindPassthrough(
   const out = json as { object?: string; context_id?: string; bound?: number };
   return { status: 200, payload: { object: out.object ?? "hrr.context", context_id: out.context_id, bound: out.bound } };
 }
+
+/**
+ * OUROBOROS memory — the model's durable external partition, per-tenant.
+ *
+ * Free passthroughs (like bindPassthrough): writing and reading your OWN memory
+ * is infrastructure, not a metered inference. The sidecar still returns
+ * `_meta.lecore.cost` + `_meta.lecore.receipt` on every call, so a metered lane
+ * can be layered on later without changing the wire. See the sidecar's
+ * ouroboros.py and leCore docs/ZOO.md §7-8.
+ */
+export async function memoryWrite(
+  cfg: Config,
+  body: { text?: string; tags?: string[] },
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  if (typeof body.text !== "string" || !body.text.trim()) return { status: 400, payload: { error: "text (string) required" } };
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/memory/write`,
+    { tenant_id: cfg.lecoreTenant, text: body.text, tags: Array.isArray(body.tags) ? body.tags : [] },
+    cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string; code?: string };
+    return { status, payload: { error: j?.error || `memory_write -> ${status}`, code: j?.code } };
+  }
+  return { status: 200, payload: json as Record<string, unknown> };
+}
+
+export async function memorySearch(
+  cfg: Config,
+  body: { query?: string; top?: number; tags?: string[] },
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  if (typeof body.query !== "string" || !body.query.trim()) return { status: 400, payload: { error: "query (string) required" } };
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/memory/search`,
+    { tenant_id: cfg.lecoreTenant, query: body.query, top: body.top ?? 4, ...(Array.isArray(body.tags) ? { tags: body.tags } : {}) },
+    cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string; code?: string };
+    return { status, payload: { error: j?.error || `memory_search -> ${status}`, code: j?.code } };
+  }
+  return { status: 200, payload: json as Record<string, unknown> };
+}

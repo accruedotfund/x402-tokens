@@ -7,7 +7,7 @@ import { loadConfig, type Config } from "./config.js";
 import { complete, listModels } from "./openrouter.js";
 import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive } from "./quote.js";
-import { attach, bindPassthrough, ContextGoneError, prepare, type LecoreResult } from "./lecore.js";
+import { attach, bindPassthrough, ContextGoneError, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 import * as usage from "./usage.js";
 
@@ -352,6 +352,26 @@ export function createServerFor(cfg: Config) {
       // Learn the corpus size so later asks against this context scale their
       // retrieval breadth to it (see scaleTopK).
       rememberChunks((payload as { context_id?: string }).context_id, (payload as { bound?: number }).bound);
+      logEvent({
+        path: url.pathname,
+        status: "free",
+        bodyBytes: Buffer.byteLength(raw),
+        ip: shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined),
+        http: status,
+      });
+      return json(res, status, payload);
+    }
+
+    // OUROBOROS memory — the model's durable external partition (leCore ZOO.md §8).
+    // Free passthroughs like /v1/hrr/bind; per-tenant via x-openzoo-namespace.
+    if (req.method === "POST" && (url.pathname === "/v1/memory/write" || url.pathname === "/v1/memory/search")) {
+      const raw = await readBody(req);
+      let body: Record<string, unknown>;
+      try { body = JSON.parse(raw || "{}"); } catch { return json(res, 400, { error: "invalid json" }); }
+      const tcfg = { ...cfg, lecoreTenant: tenantFor(cfg, req) };
+      const { status, payload } = url.pathname === "/v1/memory/write"
+        ? await memoryWrite(tcfg, body as { text?: string; tags?: string[] })
+        : await memorySearch(tcfg, body as { query?: string; top?: number; tags?: string[] });
       logEvent({
         path: url.pathname,
         status: "free",
