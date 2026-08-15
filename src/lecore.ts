@@ -155,6 +155,23 @@ export async function prepare(
   if (!cfg.lecoreUrl) return off("LECORE_HRR_URL unset");
   if (before <= cfg.lecoreSpillTokens) return off("under spill threshold");
 
+  // TOOL CONVERSATIONS ARE FORWARDED INTACT. keepToolPairs keeps a call with
+  // its result across the spill boundary, but that is not enough for a
+  // provider whose tool API is STATEFUL (OpenAI/Azure Responses API): removing
+  // ANY message and prepending a recalled-context system message invalidates
+  // the server-side correlation, and the continuation 400s with
+  //   "No tool call found for function call output with call_id …"
+  // MEASURED: multi-turn agent runs on openai/gpt-5.6-sol-pro failed
+  // repeatedly while every synthetic spill reproduced clean. So when tool
+  // calls are present we do not spill at all — the body forwards whole and the
+  // fail-open pricing (markup 1) means the caller is not overcharged for it.
+  const hasTools = msgs.some((m) =>
+    Array.isArray((m as { tool_calls?: unknown[] }).tool_calls)
+    || m.role === "tool"
+    || (Array.isArray(m.content) && (m.content as Array<{ type?: string }>).some(
+      (b) => b?.type === "tool_use" || b?.type === "tool_result")));
+  if (hasTools) return off("fail-open: tool-call conversation forwarded intact (stateful provider tool-state)");
+
   let { live, spill } = split(msgs, cfg.lecoreSpillTokens);
   // Never orphan a tool result from its call across the spill boundary.
   ({ live, spill } = keepToolPairs(live, spill));
