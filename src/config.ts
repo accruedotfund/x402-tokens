@@ -64,6 +64,9 @@ export interface Config {
   lecoreTenant: string;
   lecoreSpillTokens: number;
   lecoreTopK: number;
+  /** Chunks in the referenced context, learned at bind time. Drives the
+   *  coverage note; undefined = unknown, which the note handles. */
+  lecoreCorpusChunks?: number;
   lecoreTailChars: number;
   lecoreChunkChars: number;
   lecoreQueryChars: number;

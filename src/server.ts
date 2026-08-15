@@ -7,7 +7,7 @@ import { loadConfig, type Config } from "./config.js";
 import { complete, listModels } from "./openrouter.js";
 import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive } from "./quote.js";
-import { attach, bindPassthrough, ContextGoneError, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
+import { attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 import * as usage from "./usage.js";
 
@@ -71,7 +71,8 @@ async function withTenantFallback<T>(
   let last: unknown;
   for (let i = 0; i < tenants.length; i++) {
     try {
-      return await fn({ ...cfg, lecoreTenant: tenants[i], lecoreTopK: topKFor(cfg, req, ctxHint) });
+      return await fn({ ...cfg, lecoreTenant: tenants[i], lecoreTopK: topKFor(cfg, req, ctxHint),
+        lecoreCorpusChunks: ctxHint ? contextChunks.get(ctxHint) : undefined });
     } catch (e) {
       last = e;
       // ContextGoneError here means "not in THIS tenant", which is exactly the
@@ -364,6 +365,21 @@ export function createServerFor(cfg: Config) {
 
     // OUROBOROS memory — the model's durable external partition (leCore ZOO.md §8).
     // Free passthroughs like /v1/hrr/bind; per-tenant via x-openzoo-namespace.
+    // leCore faculties — ZOO.md §1. Free, like /v1/models: a catalog you must
+    // pay to read is a catalog models will hand-roll around.
+    if (req.method === "POST" && /^\/v1\/lecore\/(find|describe|invoke)$/.test(url.pathname)) {
+      const op = url.pathname.split("/").pop() as "find" | "describe" | "invoke";
+      const raw = await readBody(req);
+      let body: Record<string, unknown>;
+      try { body = JSON.parse(raw || "{}"); } catch { return json(res, 400, { error: "invalid json" }); }
+      const tcfg = { ...cfg, lecoreTenant: tenantFor(cfg, req) };
+      const { status, payload } = await lecoreCall(tcfg, op, body);
+      logEvent({ path: url.pathname, status: "free", bodyBytes: Buffer.byteLength(raw),
+                 ip: shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined),
+                 http: status });
+      return json(res, status, payload);
+    }
+
     if (req.method === "POST" && (url.pathname === "/v1/memory/write" || url.pathname === "/v1/memory/search")) {
       const raw = await readBody(req);
       let body: Record<string, unknown>;

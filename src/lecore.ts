@@ -67,6 +67,37 @@ export function askOf(s: string, max: number): string {
 }
 
 
+
+/**
+ * CALIBRATED HONESTY ABOUT COVERAGE — leCore docs/ZOO.md §2.
+ *
+ * Retrieval hands the model top_k chunks of a corpus that may hold thousands,
+ * and the model has no way to know which. MEASURED in production: asked to
+ * "list every mention of pump.fun" over a 7,000-chunk corpus at top_k=16, the
+ * model answered confidently and completely — and an agent's grep then found
+ * evidence retrieval had never surfaced. The corpus held it; the pass never
+ * saw it; nothing in the prompt said so.
+ *
+ * A silent under-answer is the worst failure a retrieval system has, because
+ * it is indistinguishable from a correct one. So the preamble now STATES the
+ * coverage, and when it is partial it tells the model to say so rather than
+ * imply completeness. This is the cheap half of leCore's abstention story:
+ * not a promised false-alarm rate, just a refusal to let the model imply a
+ * completeness it cannot have. Costs ~40 tokens.
+ */
+export function coverageNote(recalled: number, chunks?: number): string {
+  if (!recalled) return "";
+  if (!Number.isFinite(chunks as number) || (chunks as number) <= 0) {
+    return `\n\n[retrieval: ${recalled} passages, ranked by relevance. This is a SELECTION, not the whole corpus — if the question asks for every/all instances, say that your answer covers only what was retrieved.]`;
+  }
+  const total = chunks as number;
+  const pct = Math.min(100, Math.round((recalled / total) * 100));
+  if (recalled >= total) {
+    return `\n\n[retrieval: all ${total} passages of this corpus are present — exhaustive answers are supported.]`;
+  }
+  return `\n\n[retrieval: ${recalled} of ~${total} passages (${pct}%), ranked by relevance. This is a SELECTION. Exhaustive claims ("every", "all", "none") are NOT supported by this slice — answer from what is here and say plainly that coverage was partial. The caller can widen it with a larger top_k.]`;
+}
+
 /** tool_call ids DEFINED by the assistant messages in a set. */
 function definedCallIds(msgs: Msg[]): Set<string> {
   const ids = new Set<string>();
@@ -228,7 +259,7 @@ export async function prepare(
       });
       const tail = msgs.slice(cut);
       const rebuilt: Msg[] = slice
-        ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}` }, ...shrunk, ...tail]
+        ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote((rec?.items ?? []).length, cfg.lecoreCorpusChunks)}` }, ...shrunk, ...tail]
         : [...shrunk, ...tail];
       const after = estimateTokens(rebuilt);
       return {
@@ -317,7 +348,7 @@ export async function prepare(
     const slice = (rec?.items ?? []).map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
 
     const rebuilt: Msg[] = slice
-      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}` }, ...live]
+      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote((rec?.items ?? []).length, cfg.lecoreCorpusChunks)}` }, ...live]
       : live;
     const after = estimateTokens(rebuilt);
     return {
@@ -370,7 +401,7 @@ export async function attach(
     const items = ((rec as { items?: Array<{ text?: string }> })?.items ?? []);
     const slice = items.map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
     const rebuilt: Msg[] = slice
-      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}` }, ...msgs]
+      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote(items.length, cfg.lecoreCorpusChunks)}` }, ...msgs]
       : msgs;
     const after = estimateTokens(rebuilt);
     return {
@@ -454,6 +485,31 @@ export async function memorySearch(
   if (status < 200 || status >= 300) {
     const j = json as { error?: string; code?: string };
     return { status, payload: { error: j?.error || `memory_search -> ${status}`, code: j?.code } };
+  }
+  return { status: 200, payload: json as Record<string, unknown> };
+}
+
+
+/**
+ * leCore's own faculties, proxied — docs/ZOO.md §1, §9, §11.
+ *
+ * `find` is Rule-0 for the whole zoo ("before implementing any algorithm, ask
+ * whether leCore already has it"); `invoke` runs any of 3,214 capabilities
+ * through leCore's OWN dispatch, so private-faculty refusals and the wire
+ * conventions are inherited rather than re-enforced here. Discovery is free —
+ * charging to look at a catalog would just make models hand-roll instead.
+ */
+export async function lecoreCall(
+  cfg: Config,
+  op: "find" | "describe" | "invoke",
+  body: Record<string, unknown>,
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/lecore/${op}`,
+    { tenant_id: cfg.lecoreTenant, ...body }, cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string; code?: string };
+    return { status, payload: { error: j?.error || `lecore_${op} -> ${status}`, code: j?.code } };
   }
   return { status: 200, payload: json as Record<string, unknown> };
 }
