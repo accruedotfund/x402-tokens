@@ -40,6 +40,65 @@ function tenantFor(cfg: Config, req: IncomingMessage): string {
   return `${cfg.lecoreTenant}_${h}`;
 }
 
+/**
+ * Tenants to try, in order, for an operation that references an EXISTING
+ * context id.
+ *
+ * A context bound before namespacing — or bound by a different tool that does
+ * not send the header — lives in the base tenant, and looking it up in the
+ * namespaced one fails. MEASURED in production: an agent bound a corpus with
+ * a plain script (tenant "zoo"), then asked through the shim (tenant
+ * "zoo_<hash>") and every spill bind came back 400, silently disabling the
+ * whole feature for that conversation.
+ *
+ * New contexts are still created in the caller's own tenant — this fallback
+ * only makes a PRE-EXISTING id reachable, so isolation holds going forward
+ * while nothing bound earlier is orphaned.
+ */
+function tenantCandidates(cfg: Config, req: IncomingMessage): string[] {
+  const own = tenantFor(cfg, req);
+  return own === cfg.lecoreTenant ? [own] : [own, cfg.lecoreTenant];
+}
+
+/** Run `fn` against each candidate tenant, returning the first that succeeds. */
+async function withTenantFallback<T>(
+  cfg: Config,
+  req: IncomingMessage,
+  fn: (c: Config) => Promise<T>,
+): Promise<T> {
+  const tenants = tenantCandidates(cfg, req);
+  let last: unknown;
+  for (let i = 0; i < tenants.length; i++) {
+    try {
+      return await fn({ ...cfg, lecoreTenant: tenants[i], lecoreTopK: topKFor(cfg, req) });
+    } catch (e) {
+      last = e;
+      // ContextGoneError here means "not in THIS tenant", which is exactly the
+      // case the fallback exists for — keep going. Only the last candidate's
+      // failure is the real answer.
+    }
+  }
+  throw last;
+}
+
+
+/**
+ * Retrieval breadth for THIS request.
+ *
+ * top_k is the number of chunks the sidecar returns, and the default is tuned
+ * for pointed questions. An exhaustive ask ("list every mention of X") over a
+ * large corpus needs far more: MEASURED on an 8.7MB Telegram export (~7,000
+ * chunks), top_k=16 surfaced ~19KB and an agent's grep found pump.fun and
+ * Solana evidence that retrieval had missed — the corpus held it, the pass
+ * never saw it. Callers that know they want breadth can now say so, bounded
+ * so nobody can ask for the whole corpus and blow the bill up.
+ */
+function topKFor(cfg: Config, req: IncomingMessage): number {
+  const raw = Number(req.headers["x-hrr-top-k"]);
+  if (!Number.isFinite(raw)) return cfg.lecoreTopK;
+  return Math.min(Math.max(Math.floor(raw), 1), 256);
+}
+
 const CLIENT_USABLE_CONTEXT = 128_000_000;
 /** One POST cannot carry the whole ceiling: the edge 413s near ~32MiB. */
 const MAX_SINGLE_POST_TOKENS = 9_800_000;
@@ -281,7 +340,9 @@ export function createServerFor(cfg: Config) {
       let prepped: Record<string, unknown> = body as Record<string, unknown>;
       let lecoreInfo: LecoreResult["info"];
       try {
-        const r = await prepare({ ...cfg, lecoreTenant: tenantFor(cfg, req) }, body as Record<string, unknown>, thread);
+        const r = thread
+          ? await withTenantFallback(cfg, req, (c) => prepare(c, body as Record<string, unknown>, thread))
+          : await prepare({ ...cfg, lecoreTenant: tenantFor(cfg, req), lecoreTopK: topKFor(cfg, req) }, body as Record<string, unknown>, thread);
         prepped = r.body;
         lecoreInfo = r.info;
       } catch (e) {
@@ -295,7 +356,7 @@ export function createServerFor(cfg: Config) {
       // A dead context 404s BEFORE the 402 so a stale manifest re-binds free.
       if (headerCtx && !lecoreInfo.engaged && cfg.lecoreUrl) {
         try {
-          const a = await attach({ ...cfg, lecoreTenant: tenantFor(cfg, req) }, prepped, headerCtx);
+          const a = await withTenantFallback(cfg, req, (c) => attach(c, prepped, headerCtx));
           prepped = a.body;
           lecoreInfo = a.info;
         } catch (e) {
