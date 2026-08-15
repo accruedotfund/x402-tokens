@@ -96,10 +96,15 @@ async function withTenantFallback<T>(
  */
 /** Ceiling for an EXPLICIT X-HRR-Top-K. */
 const TOP_K_MAX = 256;
-/** Ceiling for AUTOMATIC widening — deliberately lower than the explicit one.
- *  Every chunk is billed prompt tokens, so the default must never surprise
- *  someone with a dollar-a-question bill; asking for more is opt-in. */
-const TOP_K_AUTO_MAX = 96;
+/**
+ * Ceiling for AUTOMATIC widening. Same as the explicit ceiling on purpose:
+ * a low auto-cap makes "adaptive" a lie — it pinned a 500-chunk corpus and a
+ * 50,000-chunk corpus to the identical breadth, which is the exact failure
+ * (fixed top_k regardless of size) this was meant to remove. The log2 curve
+ * below is ALREADY the cost control: it grows sub-linearly forever, so a 100×
+ * bigger corpus buys ~3.5× the breadth, never 100×.
+ */
+const TOP_K_AUTO_MAX = TOP_K_MAX;
 /** Chunks bound per context, learned at bind time. Bounded, in-memory, and
  *  per-machine — a miss just means the default, never an error. */
 const contextChunks = new Map<string, number>();
