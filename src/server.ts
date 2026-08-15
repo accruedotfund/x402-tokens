@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { appendFileSync, readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "./config.js";
@@ -8,6 +8,7 @@ import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive } from "./quote.js";
 import { attach, bindPassthrough, ContextGoneError, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
+import * as usage from "./usage.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const metaDir = join(here, "..", "meta");
@@ -29,10 +30,14 @@ const readBody = (req: IncomingMessage) =>
 // ---------------------------------------------------------------------------
 // Observability. One structured "evt" line per chat request — before this,
 // the only log was the settle result, so user acquisition was unmeasurable
-// server-side. Mirrored to /data/usage_events.jsonl when a volume is mounted
-// (none today — Fly log retention is the store until one exists).
-// No PII beyond a truncated payer and a truncated IP.
-const USAGE_FILE = "/data/usage_events.jsonl";
+// server-side. The same event now also goes to the usage store (in-memory ring
+// + /data/usage_events.jsonl when a volume is mounted), which is what
+// GET /v1/usage and /v1/usage/summary read.
+//
+// The STORED row keeps the full payer address (public on-chain, and a payer
+// has to be able to look themselves up); the LOG LINE keeps the 8-char form it
+// has always had. IPs are truncated at capture in both, and no endpoint ever
+// returns one.
 
 /** First 8 chars of a payer address — enough to count distinct payers, not to dox one. */
 export const shortPayer = (p?: string) => (p ? p.slice(0, 8) : undefined);
@@ -46,11 +51,9 @@ export const shortIp = (ip?: string) => {
 };
 
 const logEvent = (e: Record<string, unknown>) => {
-  const line = JSON.stringify({ ts: new Date().toISOString(), ...e });
-  console.log("evt", line);
-  if (existsSync("/data")) {
-    try { appendFileSync(USAGE_FILE, line + "\n"); } catch { /* telemetry must never fail a request */ }
-  }
+  const stored: Record<string, unknown> = { ts: new Date().toISOString(), ...e };
+  usage.record(stored as usage.UsageEvent); // never throws — telemetry must not fail a request
+  console.log("evt", JSON.stringify({ ...stored, payer: shortPayer(stored.payer as string | undefined) }));
 };
 
 export function createServerFor(cfg: Config) {
@@ -95,6 +98,74 @@ export function createServerFor(cfg: Config) {
       });
     }
 
+    // -----------------------------------------------------------------------
+    // Usage. Three reads, no writes.
+    //
+    //   /v1/usage/local    this machine's shard only — the fan-out target, and
+    //                      the honest answer to "what does ONE machine know?"
+    //   /v1/usage          one payer's own history, merged across machines
+    //   /v1/usage/summary  aggregate, non-identifying counters
+    //
+    // AUTH — deliberately none. The key is a Solana address that is already
+    // public on-chain, as are the amounts and the settle transactions, so a
+    // token here would only stop the payer from reading their own receipts.
+    // What we do NOT publish is anything not already public: no IPs at any
+    // resolution, no request bodies, no prompts. The unauthenticated status is
+    // stated in the response so nobody assumes these rows are private.
+    if (req.method === "GET" && url.pathname === "/v1/usage/local") {
+      const payer = url.searchParams.get("payer");
+      if (!payer) return json(res, 200, usage.localSummary());
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 200, 1), 5000);
+      return json(res, 200, {
+        machine: usage.machineId,
+        events: usage.localEventsFor(payer, limit).map(usage.publicEvent),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/usage") {
+      const payer = (url.searchParams.get("payer") || (req.headers["x-payer"] as string) || "").trim();
+      if (!payer) {
+        return json(res, 400, {
+          error: "pass ?payer=<solana address> (or an X-Payer header) to see that payer's usage",
+          aggregate: `${cfg.publicUrl}/v1/usage/summary`,
+        });
+      }
+      if (payer.length < 6) return json(res, 400, { error: "payer must be at least 6 characters (prefix match allowed)" });
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 1000);
+      const scan = Math.max(limit, 2000); // totals cover more than the rows we print back
+      const q = `/v1/usage/local?payer=${encodeURIComponent(payer)}&limit=${scan}`;
+      const mine = usage.localEventsFor(payer, scan).map(usage.publicEvent);
+      const { results, expected, responded } = await usage.fanout<{ events: usage.PublicEvent[] }>(q);
+      const merged = [...mine, ...results.flatMap((r) => r.events || [])]
+        .sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+      const roll = usage.aggregate(merged);
+      return json(res, 200, {
+        payer,
+        matched: merged.length ? (merged[0].payer === payer ? "exact" : "prefix") : "none",
+        ...roll,
+        events: merged.slice(0, limit),
+        events_returned: Math.min(limit, merged.length),
+        events_matched: merged.length,
+        coverage: usage.coverage(expected, responded, {
+          totals_cover: `the ${merged.length} matched event(s) still retained — not all time`,
+          auth: "unauthenticated: keyed on a public Solana address, so anyone who knows the address can read these rows. No IPs, bodies or prompts are returned.",
+        }),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/usage/summary") {
+      const mine = usage.localSummary();
+      const { results, expected, responded } = await usage.fanout<usage.Shard>("/v1/usage/local");
+      const merged = usage.mergeShards([mine, ...results]);
+      return json(res, 200, {
+        app: "x402-tokens",
+        ...merged,
+        coverage: usage.coverage(expected, responded, {
+          identifying: "none — payer counts are distinct 8-char prefixes, never full addresses or IPs",
+        }),
+      });
+    }
+
     if (req.method === "GET" && (url.pathname === "/.well-known/x402.json" || url.pathname === "/quote")) {
       const dummy = { model: cfg.defaultModel, messages: [{ role: "user", content: "ping" }], max_tokens: 32 };
       const q = await quoteLive(cfg, dummy);
@@ -120,6 +191,10 @@ export function createServerFor(cfg: Config) {
         object: "model",
         owned_by: "openrouter",
         pricing: { prompt: m.prompt * cfg.markup, completion: m.completion * cfg.markup, unit: "USD", markup: cfg.markup },
+        // Clients size their corpus off this — OpenRouter supplies it, and
+        // harnesses read either spelling, so emit both. Omitted when unknown
+        // rather than invented.
+        ...(m.context ? { context_length: m.context, context_window: m.context } : {}),
       }));
       return json(res, 200, { object: "list", data });
     }
@@ -251,7 +326,7 @@ export function createServerFor(cfg: Config) {
       console.log("settle", JSON.stringify(settled));
       if (!settled.success) {
         const reason = (settled.errorReason ?? "settle failed").slice(0, 300);
-        evt("failed_settle", { payer: shortPayer(settled.payer ?? v.payer), reason, billedUsd: q.billedUsd });
+        evt("failed_settle", { payer: settled.payer ?? v.payer, reason, billedUsd: q.billedUsd });
         // clean 402, retryable: the client rebuilds (fresh blockhash / topped-up
         // balance) and pays against the re-quote below.
         return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt });
@@ -259,9 +334,10 @@ export function createServerFor(cfg: Config) {
 
       const out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...prepped, stream: false }, cfg.publicUrl);
       evt(out.status >= 200 && out.status < 300 ? "paid_200" : "paid_upstream_error", {
-        payer: shortPayer(settled.payer ?? v.payer),
+        payer: settled.payer ?? v.payer,
         upstream: out.status,
         billedUsd: q.billedUsd,
+        tx: settled.transaction, // public on-chain; the receipt a caller can verify themselves
       });
       return json(res, out.status, {
         ...(out.json as object),
@@ -285,10 +361,14 @@ export function createServerFor(cfg: Config) {
   return {
     handler,
     listen(port = cfg.port) {
+      usage.initUsage(); // notices the volume (if any) and replays its tail into the ring
       const s = createServer((req, res) => {
         handler(req, res).catch((e) => json(res, 500, { error: (e as Error).message.slice(0, 160) }));
       });
-      s.listen(port, "0.0.0.0", () => console.log(`x402-tokens :${port}  ${cfg.publicUrl}`));
+      // "::" = dual stack (IPv4-mapped still accepted). 0.0.0.0 bound IPv4 only,
+      // which left the machine unreachable on its Fly 6PN address — the usage
+      // fan-out between machines talks over exactly that address.
+      s.listen(port, process.env.BIND_HOST || "::", () => console.log(`x402-tokens :${port}  ${cfg.publicUrl}`));
       return s;
     },
   };
