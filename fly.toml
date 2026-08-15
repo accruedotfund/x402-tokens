@@ -11,6 +11,14 @@ primary_region = "iad"
   auto_start_machines = true
   min_machines_running = 1
 
+# Usage events outlive the log window. Each machine mounts its OWN 1GB volume
+# and writes its own shard of usage_events.jsonl (Fly volumes are per-machine,
+# not shared) — /v1/usage fans out over 6PN and merges the shards, and says how
+# many machines answered so a partial read is never presented as complete.
+[mounts]
+  source = "data"
+  destination = "/data"
+
 [[vm]]
   cpu_kind = "shared"
   cpus = 1

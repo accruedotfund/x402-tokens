@@ -125,7 +125,16 @@ export async function prepare(
   // context-bench NIAH: 10,345 tokens, engaged=false, answered by raw attention.
   // So when the live window is still oversized, carve the LAST message: keep its
   // tail (the actual ask) and spill the head as passages.
-  if (spill.length === 0 && live.length > 0) {
+  //
+  // THE GUARD IS "live is still fat", NOT "spill is empty". Requiring an empty
+  // spill was a real, expensive bug: an agent conversation (older turns + a
+  // huge recent tool result / pasted corpus) put the older turns in spill and
+  // then left the giant last message WHOLE in the live window — MEASURED in
+  // production, a 2.78MB Cursor body reported tokens_before == tokens_after ==
+  // 677,948, i.e. leCore "engaged" and forwarded the entire book anyway, at
+  // $3.39 a call, repeatedly. Single-message bodies spilled fine, which is why
+  // it survived testing. Carve whenever the live window is over the threshold.
+  if (estimateTokens(live) > cfg.lecoreSpillTokens && live.length > 0) {
     const lastIdx = live.length - 1;
     const body_ = text(live[lastIdx].content);
     const tailChars = cfg.lecoreTailChars;
@@ -140,8 +149,10 @@ export async function prepare(
       // fact split across two chunks is retrievable from neither") and splits
       // on paragraphs instead. So send the head WHOLE and let the sidecar
       // chunk it with leCore; `chunk: true` on bind does that server-side.
+      // Preserve anything already destined for spill — older turns come first
+      // so the bound corpus keeps conversation order.
       const passages: Msg[] = [{ role: live[lastIdx].role ?? "user", content: head }];
-      spill = [...live.slice(0, lastIdx), ...passages];
+      spill = [...spill, ...live.slice(0, lastIdx), ...passages];
       live = [{ ...live[lastIdx], content: tail }];
     }
   }

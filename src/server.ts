@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,37 @@ import { challenge, requirements, settle, verify } from "./x402.js";
 import * as usage from "./usage.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
+
+/**
+ * What a CLIENT can use, which is not what the transformer holds. Bodies past
+ * the spill threshold are carved and bound to the HRR sidecar before the 402,
+ * and `POST /v1/hrr/bind` + `X-HRR-Context` does it explicitly — so the usable
+ * ceiling is the bind capacity, not any single model's window.
+ */
+/**
+ * Per-caller context isolation.
+ *
+ * Every bind used to land in ONE sidecar tenant ("zoo"), so a context was
+ * protected only by its id being unguessable — no isolation between callers
+ * at all, and the free bind endpoint means anyone can write into that shared
+ * space. Callers now supply an opaque namespace (the shim sends a hash of its
+ * wallet pubkey) which is hashed into the tenant id, so one wallet's corpora
+ * are unreachable from another's even if an id leaks.
+ *
+ * Hashed, not used raw: the namespace should not become a way to write
+ * arbitrary tenant strings into the sidecar, and hashing bounds the shape.
+ * Callers that send nothing keep the legacy shared tenant.
+ */
+function tenantFor(cfg: Config, req: IncomingMessage): string {
+  const ns = req.headers["x-openzoo-namespace"];
+  if (typeof ns !== "string" || !ns.trim()) return cfg.lecoreTenant;
+  const h = createHash("sha256").update(ns.trim()).digest("hex").slice(0, 16);
+  return `${cfg.lecoreTenant}_${h}`;
+}
+
+const CLIENT_USABLE_CONTEXT = 128_000_000;
+/** One POST cannot carry the whole ceiling: the edge 413s near ~32MiB. */
+const MAX_SINGLE_POST_TOKENS = 9_800_000;
 const metaDir = join(here, "..", "meta");
 
 const json = (res: ServerResponse, code: number, body: unknown, extra: Record<string, string> = {}) => {
@@ -191,10 +223,17 @@ export function createServerFor(cfg: Config) {
         object: "model",
         owned_by: "openrouter",
         pricing: { prompt: m.prompt * cfg.markup, completion: m.completion * cfg.markup, unit: "USD", markup: cfg.markup },
-        // Clients size their corpus off this — OpenRouter supplies it, and
-        // harnesses read either spelling, so emit both. Omitted when unknown
-        // rather than invented.
-        ...(m.context ? { context_length: m.context, context_window: m.context } : {}),
+        // CLIENT-USABLE context, not the transformer window. Every model here
+        // sits behind leCore auto-spill (+ POST /v1/hrr/bind), so a caller can
+        // hand any of them a corpus far past its attention limit — that is the
+        // whole product. Advertising the raw window tells clients to chunk
+        // when they don't have to. The true attention limit stays visible as
+        // max_model_len; single-POST ceiling is separate because a body that
+        // big 413s at the edge regardless of what the model can hold.
+        context_length: CLIENT_USABLE_CONTEXT,
+        context_window: CLIENT_USABLE_CONTEXT,
+        max_single_post_tokens: MAX_SINGLE_POST_TOKENS,
+        ...(m.context ? { max_model_len: m.context } : {}),
       }));
       return json(res, 200, { object: "list", data });
     }
@@ -209,7 +248,7 @@ export function createServerFor(cfg: Config) {
       } catch {
         return json(res, 400, { error: "invalid json" });
       }
-      const { status, payload } = await bindPassthrough(cfg, body);
+      const { status, payload } = await bindPassthrough({ ...cfg, lecoreTenant: tenantFor(cfg, req) }, body);
       logEvent({
         path: url.pathname,
         status: "free",
@@ -242,7 +281,7 @@ export function createServerFor(cfg: Config) {
       let prepped: Record<string, unknown> = body as Record<string, unknown>;
       let lecoreInfo: LecoreResult["info"];
       try {
-        const r = await prepare(cfg, body as Record<string, unknown>, thread);
+        const r = await prepare({ ...cfg, lecoreTenant: tenantFor(cfg, req) }, body as Record<string, unknown>, thread);
         prepped = r.body;
         lecoreInfo = r.info;
       } catch (e) {
@@ -256,7 +295,7 @@ export function createServerFor(cfg: Config) {
       // A dead context 404s BEFORE the 402 so a stale manifest re-binds free.
       if (headerCtx && !lecoreInfo.engaged && cfg.lecoreUrl) {
         try {
-          const a = await attach(cfg, prepped, headerCtx);
+          const a = await attach({ ...cfg, lecoreTenant: tenantFor(cfg, req) }, prepped, headerCtx);
           prepped = a.body;
           lecoreInfo = a.info;
         } catch (e) {
@@ -295,6 +334,10 @@ export function createServerFor(cfg: Config) {
         ip,
         tokens_before: lecoreInfo.tokensBefore,
         tokens_after: lecoreInfo.tokensAfter,
+        // WHY leCore did not engage. Without this a fail-open is invisible in
+        // telemetry — it looks identical to "engaged and forwarded", and the
+        // only symptom is a surprising bill.
+        lecore_reason: lecoreInfo.engaged ? undefined : lecoreInfo.reason,
         spill_tokens: lecoreInfo.spilledTokens,
         recalled: lecoreInfo.recalled,
         corpus_reuse: lecoreInfo.mode === "attach" || undefined,

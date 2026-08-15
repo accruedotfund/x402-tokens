@@ -57,7 +57,7 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
     resource,
     description: q.pricing === "counterfactual"
       ? `${q.model} — ${(q.savesVsDirect ?? 1).toFixed(1)}× cheaper than buying direct, at ${a.pricedAt}`
-      : `OpenRouter ${q.model} × ${cfg.markup} at ${a.pricedAt}`,
+      : `OpenRouter ${q.model} × ${q.markup} at ${a.pricedAt}`,
     maxTimeoutSeconds: 120,
     extra: {
       facilitator: cfg.facilitator,
@@ -76,7 +76,12 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
       pricing: q.pricing,
       directUsd: q.directUsd,
       savesVsDirect: q.savesVsDirect,
-      markup: q.pricing === "markup" ? cfg.markup : undefined,
+      // The EFFECTIVE multiplier, not the configured one. On the fail-open
+      // path quoteLive runs with markup 1 (we charge at cost when our own
+      // memory did not engage) — reporting cfg.markup there told the caller
+      // they paid 3x when they paid 1x, on exactly the calls where trust
+      // matters most. q.markup is what actually formed this price.
+      markup: q.pricing === "markup" ? q.markup : undefined,
     },
   };
   });
