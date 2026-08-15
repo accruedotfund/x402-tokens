@@ -67,6 +67,45 @@ export function askOf(s: string, max: number): string {
 }
 
 
+/** tool_call ids DEFINED by the assistant messages in a set. */
+function definedCallIds(msgs: Msg[]): Set<string> {
+  const ids = new Set<string>();
+  for (const m of msgs) {
+    const calls = (m as { tool_calls?: Array<{ id?: string }> }).tool_calls;
+    if (Array.isArray(calls)) for (const c of calls) if (c?.id) ids.add(c.id);
+  }
+  return ids;
+}
+
+/**
+ * A tool RESULT and the assistant tool_call that spawned it are one atomic
+ * unit — split them and the upstream rejects with
+ *   400 "No tool call found for function call output with call_id …"
+ * because every function_call_output must match an earlier function_call of
+ * the same id. The newest-first split can leave a result LIVE while its call
+ * SPILLED (the call is older, so it lands in spill; the result is newer, so it
+ * stays live). MEASURED: an agent run compacted 19,738->11,025 tokens and the
+ * orphaned result 400'd the whole turn.
+ *
+ * Fix: pull messages back from the end of spill into live until every live
+ * tool result's defining call is also live. Costs a few tokens of compaction,
+ * never correctness.
+ */
+export function keepToolPairs(live: Msg[], spill: Msg[]): { live: Msg[]; spill: Msg[] } {
+  const callIdOf = (m: Msg) => (m as { tool_call_id?: string }).tool_call_id;
+  const dangles = (l: Msg[]) => {
+    const defined = definedCallIds(l);
+    return l.some((m) => m.role === "tool" && callIdOf(m) && !defined.has(callIdOf(m) as string));
+  };
+  let l = live;
+  let s = spill;
+  while (s.length && dangles(l)) {
+    l = [s[s.length - 1], ...l];
+    s = s.slice(0, -1);
+  }
+  return { live: l, spill: s };
+}
+
 /** Newest-first walk: keep whole recent turns inside the live window, spill the rest. */
 function split(msgs: Msg[], keepTokens: number): { live: Msg[]; spill: Msg[] } {
   const live: Msg[] = [];
@@ -117,6 +156,8 @@ export async function prepare(
   if (before <= cfg.lecoreSpillTokens) return off("under spill threshold");
 
   let { live, spill } = split(msgs, cfg.lecoreSpillTokens);
+  // Never orphan a tool result from its call across the spill boundary.
+  ({ live, spill } = keepToolPairs(live, spill));
 
   // INTRA-MESSAGE SPILL. Turn-granularity is not enough: a needle-in-a-haystack
   // prompt (and any pasted document) is ONE message holding the whole corpus AND
