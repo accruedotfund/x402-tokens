@@ -170,7 +170,61 @@ export async function prepare(
     || m.role === "tool"
     || (Array.isArray(m.content) && (m.content as Array<{ type?: string }>).some(
       (b) => b?.type === "tool_use" || b?.type === "tool_result")));
-  if (hasTools) return off("fail-open: tool-call conversation forwarded intact (stateful provider tool-state)");
+
+  // STRUCTURE-PRESERVING SPILL for tool conversations.
+  //
+  // A stateful provider (OpenAI/Azure Responses API) correlates tool calls by
+  // id; removing a spilled message or reordering the array breaks that and the
+  // continuation 400s "No tool call found for function call output". But the
+  // provider does NOT care how LONG a tool result is — only that its envelope
+  // (role, tool_call_id, order) is present. So keep EVERY message in place and
+  // only shrink the heavy CONTENT of older ones, binding the full text to the
+  // sidecar and replacing it with a short marker. Nothing is removed => nothing
+  // can be orphaned; the big tokens (accumulated tool-result dumps) still leave
+  // the request => the discount survives.
+  if (hasTools) {
+    const KEEP_TAIL = 4;               // most recent messages stay verbatim
+    const SHRINK_OVER = 400;           // only shrink content longer than this
+    const HEAD = 200;                  // chars of the original head to retain
+    const cut = Math.max(0, msgs.length - KEEP_TAIL);
+    const oldMsgs = msgs.slice(0, cut);
+    const items = oldMsgs
+      .map((m, i) => ({ text: `[${i}] ${m.role ?? "user"}: ${text(m.content)}` }))
+      .filter((it) => it.text.trim().length > 0);
+    if (!items.length) return off("nothing older than the live window");
+    try {
+      const bind = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/bind`,
+        { tenant_id: cfg.lecoreTenant, items, chunk: true,
+          chunk_max_chars: cfg.lecoreChunkChars, chunk_overlap: cfg.lecoreChunkOverlap,
+          ...(thread ? { context_id: thread } : {}) }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { context_id?: string };
+      const contextId = bind?.context_id;
+      if (!contextId) throw new Error("bind returned no context_id");
+      const query = askOf(text(msgs[msgs.length - 1]?.content), cfg.lecoreQueryChars);
+      const rec = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/recall`,
+        { tenant_id: cfg.lecoreTenant, context_id: contextId, query, top_k: cfg.lecoreTopK },
+        cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { items?: Array<{ text?: string }> };
+      const slice = (rec?.items ?? []).map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
+      const MARK = " … [older turn — full text in the retrieved context above]";
+      const shrunk = oldMsgs.map((m) => {
+        const t = text(m.content);
+        if (typeof m.content !== "string" || t.length <= SHRINK_OVER) return m; // envelope kept as-is
+        return { ...m, content: t.slice(0, HEAD) + MARK };                      // id/role preserved, content shrunk
+      });
+      const tail = msgs.slice(cut);
+      const rebuilt: Msg[] = slice
+        ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}` }, ...shrunk, ...tail]
+        : [...shrunk, ...tail];
+      const after = estimateTokens(rebuilt);
+      return {
+        body: { ...body, messages: rebuilt },
+        info: { engaged: true, contextId, tokensBefore: before, tokensAfter: after, spilledTokens: before - after, mode: "spill" },
+      };
+    } catch (e) {
+      const why = (e as Error).message.slice(0, 120);
+      if (cfg.lecoreRequired) throw new Error(`lecore_unavailable: ${why}`);
+      return off(`fail-open: ${why}`);
+    }
+  }
 
   let { live, spill } = split(msgs, cfg.lecoreSpillTokens);
   // Never orphan a tool result from its call across the spill boundary.
