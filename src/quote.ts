@@ -49,7 +49,13 @@ export async function quoteRequest(
   const modelId = body.model || cfg.defaultModel;
   const model = await getModel(cfg.openrouterUrl, cfg.openrouterKey, modelId);
   const promptTokens = estimateTokens(body.messages);
-  const maxOut = Math.min(Math.max(1, Number(body.max_tokens ?? 256)), 4096);
+  // MEASURED (ttfx goldrun, 2026-08-15): reasoning models BILL their thinking.
+  // Callers asked 8k-32k max_tokens and providers charged 16-19k completion
+  // tokens per ask, but this clamp priced at most 4,096 of output — the floor
+  // protected $0.37 of a $1.62 upstream completion and sol/fable ran at
+  // negative margin for hours. The clamp exists to stop absurd quotes on
+  // absurd asks; 32k covers every real reasoning budget we have seen.
+  const maxOut = Math.min(Math.max(1, Number(body.max_tokens ?? 256)), 32768);
   const baseUsd = openrouterUsd(model.prompt, model.completion, promptTokens, maxOut);
 
   // COUNTERFACTUAL PRICING. A markup on the tokens we forward is

@@ -9,6 +9,8 @@ import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive } from "./quote.js";
 import { attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
+import { applyCredit, creditBalance, grantCredit } from "./credits.js";
+import { dedupObserve } from "./dedup.js";
 import * as usage from "./usage.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -414,7 +416,22 @@ export function createServerFor(cfg: Config) {
       // estimateTokens(messages), so spilling after the quote would bill the
       // caller 3x on the whole book and hand them the discount they already
       // paid for. Thread key lets a caller keep one holographic context.
-      const headerCtx = req.headers["x-hrr-context"] as string | undefined;
+      let headerCtx = req.headers["x-hrr-context"] as string | undefined;
+      // ZERO-INTEGRATION DEDUP: clients that never heard of X-HRR-Context but
+      // re-send the same fat prefix every call get it bound on sighting #2 and
+      // stripped+attached from sighting #3 on. Fail-open by construction —
+      // no match means nothing changes.
+      let dedupStripped = 0;
+      if (!headerCtx) {
+        try {
+          const dd = dedupObserve(cfg, tenantFor(cfg, req), body as { messages?: Array<{ role?: string; content?: unknown }> });
+          if (dd.contextId && dd.messages?.length) {
+            headerCtx = dd.contextId;
+            (body as { messages?: unknown }).messages = dd.messages;
+            dedupStripped = dd.strippedChars ?? 0;
+          }
+        } catch { /* dedup must never break a request */ }
+      }
       // body.user is a stock OpenAI field: grok and Claude Code set it to a
       // username / uuid, NOT a context id. Feeding that to the spill bind as a
       // context_id makes the sidecar reject the append with 400 (invalid
@@ -493,11 +510,24 @@ export function createServerFor(cfg: Config) {
         ...extra,
       });
       const header = req.headers["x-payment"] as string | undefined;
-      if (!header) {
-        evt("402_quoted", { billedUsd: q.billedUsd });
+      // PROVIDER-ERROR CREDITS: settle-first means an upstream error is money
+      // already taken (measured: $0.088 settled for an xAI auth-error body).
+      // Those amounts become tenant credit; a quote fully covered by credit
+      // serves WITHOUT payment. Optimistic consumption — see credits.ts.
+      const tenantKey = tenantFor(cfg, req);
+      let paidByCredit = false;
+      if (!header && q.billedUsd > 0 && creditBalance(tenantKey) >= q.billedUsd) {
+        applyCredit(tenantKey, q.billedUsd);
+        paidByCredit = true;
+        evt("credit_used", { billedUsd: q.billedUsd });
+      }
+      if (!header && !paidByCredit) {
+        evt("402_quoted", { billedUsd: q.billedUsd, dedup_stripped: dedupStripped || undefined });
         return json(res, 402, challenge(cfg, q, resource), { "x-402-priced-at": q.pricedAt });
       }
-      const v = await verify(cfg, header, reqs);
+      const v = paidByCredit
+        ? { ok: true as const, picked: { asset: "credit", maxAmountRequired: "0" } as never, payer: tenantKey }
+        : await verify(cfg, header as string, reqs);
       if (!v.ok || !v.picked) {
         evt("402_invalid", { reason: (v.reason ?? "invalid payment").slice(0, 200) });
         return json(res, 402, challenge(cfg, q, resource, v.reason ?? "invalid payment"));
@@ -513,7 +543,9 @@ export function createServerFor(cfg: Config) {
       // errors has already settled — the receipt names the tx so it can be
       // made right, which beats free inference on every payment that cannot
       // clear.
-      const settled = (await settle(cfg, header, v.picked).catch((e) => ({ success: false, errorReason: (e as Error).message }))) as
+      const settled = paidByCredit
+        ? { success: true, transaction: "credit", payer: tenantKey }
+        : (await settle(cfg, header as string, v.picked).catch((e) => ({ success: false, errorReason: (e as Error).message }))) as
         { success?: boolean; errorReason?: string; transaction?: string; payer?: string };
       console.log("settle", JSON.stringify(settled));
       if (!settled.success) {
@@ -547,15 +579,37 @@ export function createServerFor(cfg: Config) {
           ?.choices ?? [])[0];
         return !!ch && ch.finish_reason === "length" && !(ch.message?.content || "").trim();
       };
-      if (emptyTruncated(out)) {
-        const asked = Number((prepped as { max_tokens?: number }).max_tokens ?? 256);
-        const roomier = Math.min(Math.max(asked * 4, 512), 4096);
-        console.log("retry", JSON.stringify({ reason: "empty_truncated", asked, roomier }));
+      // ONLY RETRY WHEN THE CAP WAS PLAUSIBLY THE PROBLEM. The first version of
+      // this guard fired on ANY empty+length and re-ran at 4x max_tokens up to
+      // 4096. On an agent asking for a multi-file emission that DOUBLED an
+      // already-slow call: measured on the ttfx port, a 4000-token request
+      // against a 396k-token bound context returned empty, and the next step
+      // hung past 900s and killed the harness. A repair that can double the
+      // slowest call in the system is worse than the failure it repairs.
+      //
+      // So: retry only a SMALL cap (where reasoning genuinely eats the whole
+      // budget before any visible token), bound the bump absolutely, and never
+      // fire when the caller already asked for room.
+      const askedTok = Number((prepped as { max_tokens?: number }).max_tokens ?? 256);
+      if (emptyTruncated(out) && askedTok < 512) {
+        const roomier = 1024;
+        console.log("retry", JSON.stringify({ reason: "empty_truncated", asked: askedTok, roomier }));
         const retry = await complete(cfg.openrouterUrl, cfg.openrouterKey,
           { ...prepped, stream: false, max_tokens: roomier }, cfg.publicUrl);
         if (!emptyTruncated(retry) && retry.status >= 200 && retry.status < 300) out = retry;
+      } else if (emptyTruncated(out)) {
+        // Large caps: do NOT re-run. Say so in the response instead of
+        // returning a silent void the caller pays for and cannot diagnose.
+        console.log("empty_large_cap", JSON.stringify({ asked: askedTok }));
       }
 
+      // Upstream handed back an error object after we took payment: full
+      // billed amount becomes tenant credit, and the receipt says so.
+      const providerErrored = !!(out.json as { error?: unknown })?.error
+        && !((out.json as { choices?: unknown[] })?.choices?.length);
+      if (providerErrored && q.billedUsd > 0 && !paidByCredit) {
+        grantCredit(tenantKey, q.billedUsd, "provider_error");
+      }
       evt(out.status >= 200 && out.status < 300 ? "paid_200" : "paid_upstream_error", {
         payer: settled.payer ?? v.payer,
         upstream: out.status,
@@ -574,6 +628,11 @@ export function createServerFor(cfg: Config) {
           amount: v.picked.maxAmountRequired,
           settle: settled,
           lecore: lecoreInfo,
+          dedup_stripped_chars: dedupStripped || undefined,
+          credit: paidByCredit ? { covered: q.billedUsd } : undefined,
+          refund_credit: providerErrored && !paidByCredit
+            ? { usd: q.billedUsd, reason: "provider_error", note: "auto-applied to your next calls" }
+            : undefined,
         },
       });
     }
