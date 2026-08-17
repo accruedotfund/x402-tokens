@@ -3,6 +3,20 @@ import type { Config } from "./config.js";
 const esc = (x: unknown) =>
   String(x).replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c] as string));
 
+/** Human chain name for a CAIP-2 network id. */
+const chainName = (n: string) =>
+  n.startsWith("solana:") ? "Solana" : n === "eip155:8453" ? "Base" : n === "eip155:4663" ? "Robinhood Chain" : n;
+
+/**
+ * User-facing copy names the UNDERLYING asset, never the settlement wrap.
+ * Wrap tickers follow y<X>x / w<X>x (yUSDCx, wTOKENx, wUSDGx, future w*x
+ * twins) — strip the affixes so new wrapped rails read as their own asset
+ * automatically when they join accepts[].
+ */
+const underlyingName = (s: string) => (/^[wy].{1,}x$/.test(s) ? s.slice(1, -1) : s);
+
+const uniq = <T,>(xs: T[]) => [...new Set(xs)];
+
 /** What you paste into an agent. Keep it imperative and complete. */
 export function clankerPrompt(cfg: Config): string {
   const netOf = (a: { network?: string }) => a.network ?? cfg.network;
@@ -20,9 +34,30 @@ Content-Type: application/json
 Body is a normal OpenRouter/OpenAI chat completion:
 {"model":"${cfg.defaultModel}","messages":[{"role":"user","content":"..."}],"max_tokens":256}
 
+IMAGE AND VIDEO ARE ALSO SERVED, on their own endpoints. /v1/chat/completions
+cannot emit them — do not conclude from a text response that this endpoint has
+no media. Same 402 and same rails; billed per image or per clip, not per token.
+
+POST ${cfg.publicUrl}/v1/images/generations
+{"model":"${cfg.defaultImageModel}","prompt":"...","width":1024,"height":1024}
+  -> {"data":[{"url":"https://..."}]}
+
+POST ${cfg.publicUrl}/v1/videos/generations
+{"model":"${cfg.defaultVideoModel}","prompt":"...","seconds":5,"resolution":"720P"}
+  -> {"id":"...","status":"in_progress"}     resolution is "720P" or "1080P"
+
+GET  ${cfg.publicUrl}/v1/videos/{id}
+  -> {"status":"completed","outputs":{"video_url":"https://..."}}
+  Polling is FREE — the render was paid for at submit. Poll until status
+  leaves "in_progress"; a failed job explains itself in error.message.
+
+GET /v1/models lists these alongside the text models, tagged kind:"image" or
+kind:"video" with the per-unit price. leCore memory does NOT apply to a render
+(a prompt that short never spills) — do not claim it improved the output.
+
 You will get HTTP 402. That is the product, not an error.
 
-accepts[] will include one row per live rail. Pick ONE:
+accepts[] will include one row per offered rail. Pick ONE:
 ${rails}
 
 Every row carries its OWN network, payTo and decimals. READ THEM OFF THE ROW —
@@ -93,7 +128,33 @@ Do not use api.cdp.coinbase.com. This service names ${cfg.facilitator}. GET ${cf
  * Gold is reserved for money. Teal is the room, not a gradient.
  */
 export function renderIndex(cfg: Config): string {
-  const rails = cfg.assets.map((a) => a.symbol).join(" or ");
+  // Derived from the same asset list that emits the 402 — new rails (e.g. the
+  // memecoin twins) appear here the moment they join accepts[], no copy edit.
+  const netOf = (a: { network?: string }) => a.network ?? cfg.network;
+  const underlyings = uniq(cfg.assets.map((a) => underlyingName(a.symbol)));
+  const chains = uniq(cfg.assets.map((a) => chainName(netOf(a))));
+  const listOr = (xs: string[]) => (xs.length <= 1 ? xs.join("") : xs.slice(0, -1).join(", ") + " or " + xs[xs.length - 1]);
+  const rails = listOr(underlyings);
+  const chainList = listOr(chains);
+  // HONESTY LINE — "live/settled" is reserved for chains that have actually
+  // settled a payment. As of 2026-08-14 all three have: Solana (all day),
+  // Robinhood Chain (wUSDGx EIP-3009 batched settle), Base (native USDC
+  // EIP-3009 batched settle). A future chain starts OUTSIDE this set and is
+  // described as "offered" until its first real settlement.
+  const SETTLED = new Set(["Solana", "Base", "Robinhood Chain"]);
+  const byChain = new Map<string, string[]>();
+  for (const a of cfg.assets) {
+    const c = chainName(netOf(a));
+    byChain.set(c, uniq([...(byChain.get(c) ?? []), underlyingName(a.symbol)]));
+  }
+  const railLines = [...byChain.entries()]
+    .map(([c, assets]) => {
+      const status = SETTLED.has(c)
+        ? `<span class=live>settled real payments</span>`
+        : `<span class=new>offered · no settlement yet</span>`;
+      return `<b>${esc(c)}</b> — ${esc(assets.join(" · "))} · ${status}`;
+    })
+    .join("<br>");
   const curl = `curl -sS ${cfg.publicUrl}/v1/chat/completions \\
   -H 'content-type: application/json' \\
   -d '{"model":"${cfg.defaultModel}","messages":[{"role":"user","content":"say hi"}]}'`;
@@ -102,7 +163,7 @@ export function renderIndex(cfg: Config): string {
   return `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>tokens — pay tokens for tokens</title>
-<meta name=description content="Every model with holographic memory in front. Long context costs HALF of buying direct, paid in ${esc(rails)}, priced at the 402.">
+<meta name=description content="Every model with holographic memory in front. Long context costs HALF of buying direct, paid in ${esc(rails)} on ${esc(chainList)}, priced at the 402.">
 <link rel=icon href=/token.jpg>
 <style>
 :root{
@@ -182,6 +243,7 @@ a:hover{color:var(--ink)}
 .card h3{margin:0 0 .35rem;font-size:.95rem}
 .card p{margin:0;color:var(--mid)}
 .live{color:var(--ok);font-family:var(--mono);font-size:.75rem}
+.new{color:var(--money);font-family:var(--mono);font-size:.75rem}
 footer{color:var(--dim);font-size:.85rem}
 </style>
 <body>
@@ -190,7 +252,7 @@ footer{color:var(--dim);font-size:.85rem}
     <div>
       <div class=kicker>x402 · lecore memory · half of direct</div>
       <h1>pay <em>tokens</em> for tokens</h1>
-      <p class=lede>Every model, with holographic memory in front. Send a book — we spill it into leCore and the model only ever sees the slice that answers you, so long context costs <em>half of buying direct</em>. No API key. You pay in ${esc(rails)}, and the 402 names the exact amount in USD at that second.</p>
+      <p class=lede>Every model, with holographic memory in front. Send a book — we spill it into leCore and the model only ever sees the slice that answers you, so long context costs <em>half of buying direct</em>. No API key. You pay in ${esc(rails)} — on ${esc(chainList)} — and the 402 names the exact amount in USD at that second.</p>
       <a class=try href="https://chat.accrue.fund">try it yourself</a>
     </div>
     <img class=coin src=/token.jpg width=256 height=256 alt="TOKEN transit token">
@@ -199,12 +261,12 @@ footer{color:var(--dim);font-size:.85rem}
   <section class=prove>
     <div class=kicker>prompt your clanker</div>
     <h2>Dump this into Claude / Grok / Codex. It has everything.</h2>
-    <p class=lede style="margin-top:.4rem;font-size:var(--0)">No SDK. No OpenRouter key. If it can POST and sign one Solana <code>TransferChecked</code>, it can buy inference here. Raw prompt also at <a href="/prompt.txt"><code>/prompt.txt</code></a>.</p>
+    <p class=lede style="margin-top:.4rem;font-size:var(--0)">No SDK. No provider key. If it can POST and sign — a Solana <code>TransferChecked</code>, or an <code>EIP-3009</code> authorization on Base or Robinhood Chain — it can buy inference here. Raw prompt also at <a href="/prompt.txt"><code>/prompt.txt</code></a>.</p>
     <div class=row>
       <button id=copyclanker type=button>copy prompt</button>
     </div>
     <pre id=clanker>${esc(clanker)}</pre>
-    <div class=meta>rails: ${esc(cfg.assets.map((a) => a.symbol).join(" · "))} · payTo ${esc(cfg.payTo)}</div>
+    <div class=meta>pay in ${esc(underlyings.join(" · "))} · on ${esc(chains.join(" · "))} · the 402 names each rail's exact mint, payTo and amount</div>
   </section>
 
   <section class=prove>
@@ -219,25 +281,46 @@ footer{color:var(--dim);font-size:.85rem}
     <div class=meta id=status>unpaid POST · expect HTTP 402</div>
   </section>
 
+  <!-- MEDIA. The storefront advertised chat only, which stopped being true the
+       moment /v1/images and /v1/videos shipped — and agents were reading this
+       page, seeing text endpoints, and concluding the zoo could not do media at
+       all. Same 402, same rails, different unit of billing. -->
+  <section>
+    <div class=kicker>pictures and moving pictures</div>
+    <h2>It is not only text.</h2>
+    <p class=lede style="margin-top:.4rem;font-size:var(--0)">Image and video generate on their own endpoints — same 402, same rails, but billed <strong>per image or per clip</strong>, not per token. <code>GET /v1/models</code> lists them with <code>kind:"image"</code> / <code>kind:"video"</code> and the price per unit.</p>
+    <pre>POST /v1/images/generations
+{"model":"black-forest-labs/FLUX.1-schnell","prompt":"...","width":1024,"height":1024}
+  -> 200 {"data":[{"url":"https://..."}]}
+
+POST /v1/videos/generations
+{"model":"Wan-AI/wan2.7-t2v","prompt":"...","seconds":5,"resolution":"720P"}
+  -> 200 {"id":"...","status":"in_progress"}
+
+GET  /v1/videos/{id}          # free to poll — the render was paid for at submit
+  -> 200 {"status":"completed","outputs":{"video_url":"https://..."}}</pre>
+    <div class=meta>video is asynchronous: you pay once at submit, then poll for free until <code>status</code> leaves <code>in_progress</code> · <code>resolution</code> is <code>720P</code> or <code>1080P</code></div>
+  </section>
+
   <section>
     <div class=kicker>for degenerates</div>
     <ol>
-      <li><strong>Wrap first.</strong> Raw USDC and raw TOKEN will not settle. USDC → yUSDCx or TOKEN → wTOKENx. Same program, 20bps Token-2022 tax, yield stays in the wrap.</li>
-      <li><strong>POST the same body again</strong> with header <code>X-PAYMENT</code> = base64 of an x402 payload whose transaction is a <code>TransferChecked</code> of <code>maxAmountRequired</code> of the chosen wrap to <code>${esc(cfg.payTo)}</code>, fee payer <code>${esc(cfg.feePayer)}</code>.</li>
-      <li>The facilitator at <a href="${esc(cfg.facilitator)}">${esc(cfg.facilitator)}</a> verifies and sponsors gas. You need no SOL.</li>
-      <li>On 200 you get a normal OpenRouter chat completion. The key never leaves this host.</li>
+      <li><strong>Pick ONE row</strong> from <code>accepts[]</code>. Every row carries its own network, asset, <code>payTo</code> and <code>decimals</code> — read them off the row, they differ per rail.</li>
+      <li><strong>Solana rows:</strong> fund with USDC or TOKEN, then pay via the row's settlement mint (raw USDC/TOKEN will not settle — the 402 and <a href="${esc(cfg.facilitator)}/start">${esc(cfg.facilitator)}/start</a> spell out the deposit step). One <code>TransferChecked</code> of <code>maxAmountRequired</code>; the fee payer is sponsored, you need no SOL.</li>
+      <li><strong>Base / Robinhood Chain rows:</strong> no transaction at all — EIP-712-sign an EIP-3009 <code>TransferWithAuthorization</code> and the facilitator relays it and pays the gas. Base takes native Circle USDC directly; Robinhood Chain settles USDG (deposit path at <a href="${esc(cfg.facilitator)}/start">/start</a>).</li>
+      <li><strong>POST the same body again</strong> with header <code>X-PAYMENT</code> = base64 of the x402 payload for your rail. On 200 you get a normal OpenRouter chat completion. The key never leaves this host.</li>
     </ol>
   </section>
 
   <div class=grid>
     <div class=card>
       <h3>Price</h3>
-      <p>Two bases, and the 402 says which. <b>Long context</b> (leCore engaged): a DISCOUNT off what that exact body would have cost you buying direct — <code>extra.directUsd</code> and <code>extra.savesVsDirect</code> are on the 402, so you can check it. <b>Short bodies</b> (nothing to spill): the published USD rate times ${esc(cfg.markup)}. yUSDCx is $1. wTOKENx is Birdeye spot of <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> <em>at the 402</em>. Both wraps take 20bps on transfer — that's the yield.</p>
+      <p>Two bases, and the 402 says which. <b>Long context</b> (leCore engaged): a DISCOUNT off what that exact body would have cost you buying direct — <code>extra.directUsd</code> and <code>extra.savesVsDirect</code> are on the 402, so you can check it. <b>Short bodies</b> (nothing to spill): the published USD rate times ${esc(cfg.markup)}. USDC and USDG rails are $1 stable. <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> is Birdeye spot <em>at the 402</em>. Rails that settle through a yield wrap take 20bps on transfer — that's the yield, and <code>maxAmountRequired</code> already grosses it up.</p>
     </div>
     <div class=card>
-      <h3>What is live today</h3>
-      <p class=live>yUSDCx · wTOKENx</p>
-      <p style="margin-top:.4rem">TOKEN <code>EVULo…pump</code> on <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">pump.fun</a>. Spendable rail is wTOKENx <code>Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9</code> — Token-2022, 20bps tax, PDA fee authority.</p>
+      <h3>Rails today</h3>
+      <p>${railLines}</p>
+      <p style="margin-top:.4rem">TOKEN is <code>EVULo…pump</code> on <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">pump.fun</a>. New rails appear in <code>accepts[]</code> the moment they go live — the 402 is the source of truth, not this page.</p>
     </div>
   </div>
 
@@ -278,7 +361,7 @@ hit.onclick = async () => {
     });
     const j = await r.json();
     out.textContent = JSON.stringify(j, null, 2);
-    status.textContent = "HTTP " + r.status + (r.status === 402 ? " · that's the challenge. pay maxAmountRequired of the yUSDCx accept." : "");
+    status.textContent = "HTTP " + r.status + (r.status === 402 ? " · that's the challenge. pick ONE accepts[] row and pay its maxAmountRequired on its own network." : "");
     if (r.status !== 402) out.classList.add("err");
   } catch (e) {
     out.classList.add("err");

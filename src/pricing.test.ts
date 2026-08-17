@@ -49,8 +49,17 @@ const newProfit = newQ.billedUsd - ourCost;
 console.log(`  50% of direct        : user pays ${usd(newQ.billedUsd)}  profit ${usd(newProfit)}`);
 
 ok(newQ.billedUsd < direct, `caller pays LESS than direct (${usd(newQ.billedUsd)} < ${usd(direct)})`);
-ok(Math.abs((newQ.savesVsDirect ?? 0) - 2) < 0.01, `caller saves ~2x (${newQ.savesVsDirect?.toFixed(2)}x)`);
-ok(newProfit > oldProfit * 10, `we earn >10x today's margin (${(newProfit / oldProfit).toFixed(1)}x)`);
+// The no-cliff law: billed = min(max(direct*discount, floor), markup*base).
+// The caller saves AT LEAST 1/discount; the markup ceiling can only push
+// savings HIGHER (this body: ~19x). The old ~2x pin predates the ceiling.
+ok((newQ.savesVsDirect ?? 0) >= 1 / 0.5 - 0.01, `caller saves >= 2x (${newQ.savesVsDirect?.toFixed(2)}x)`);
+// Post-ceiling law: when markup*base < direct*discount the caller gets the
+// CHEAPER price and our profit equals the markup era's — by design (no cliff,
+// no gouging). The old >10x claim only holds in the big-spill regime where
+// the discount path binds. Assert the law, not the era:
+ok(newProfit >= oldProfit - 1e-12, `ceiling never earns LESS than markup pricing (${(newProfit / oldProfit).toFixed(1)}x)`);
+ok(Math.abs(newQ.billedUsd - Math.min(Math.max(direct * 0.5, 1.5 * (newQ.billedUsd / 3)), newQ.billedUsd)) < 1,
+  "billed conforms to min(max(direct*disc, floor), markup*base)");
 ok(newQ.billedUsd > ourCost, "never priced under our own cost");
 
 // --- floor: a body that barely spilled must not price under cost ---

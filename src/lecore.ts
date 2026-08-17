@@ -67,6 +67,76 @@ export function askOf(s: string, max: number): string {
 }
 
 
+
+/**
+ * CALIBRATED HONESTY ABOUT COVERAGE — leCore docs/ZOO.md §2.
+ *
+ * Retrieval hands the model top_k chunks of a corpus that may hold thousands,
+ * and the model has no way to know which. MEASURED in production: asked to
+ * "list every mention of pump.fun" over a 7,000-chunk corpus at top_k=16, the
+ * model answered confidently and completely — and an agent's grep then found
+ * evidence retrieval had never surfaced. The corpus held it; the pass never
+ * saw it; nothing in the prompt said so.
+ *
+ * A silent under-answer is the worst failure a retrieval system has, because
+ * it is indistinguishable from a correct one. So the preamble now STATES the
+ * coverage, and when it is partial it tells the model to say so rather than
+ * imply completeness. This is the cheap half of leCore's abstention story:
+ * not a promised false-alarm rate, just a refusal to let the model imply a
+ * completeness it cannot have. Costs ~40 tokens.
+ */
+export function coverageNote(recalled: number, chunks?: number): string {
+  if (!recalled) return "";
+  if (!Number.isFinite(chunks as number) || (chunks as number) <= 0) {
+    return `\n\n[retrieval: ${recalled} passages, ranked by relevance. This is a SELECTION, not the whole corpus — if the question asks for every/all instances, say that your answer covers only what was retrieved.]`;
+  }
+  const total = chunks as number;
+  const pct = Math.min(100, Math.round((recalled / total) * 100));
+  if (recalled >= total) {
+    return `\n\n[retrieval: all ${total} passages of this corpus are present — exhaustive answers are supported.]`;
+  }
+  return `\n\n[retrieval: ${recalled} of ~${total} passages (${pct}%), ranked by relevance. This is a SELECTION. Exhaustive claims ("every", "all", "none") are NOT supported by this slice — answer from what is here and say plainly that coverage was partial. The caller can widen it with a larger top_k.]`;
+}
+
+/** tool_call ids DEFINED by the assistant messages in a set. */
+function definedCallIds(msgs: Msg[]): Set<string> {
+  const ids = new Set<string>();
+  for (const m of msgs) {
+    const calls = (m as { tool_calls?: Array<{ id?: string }> }).tool_calls;
+    if (Array.isArray(calls)) for (const c of calls) if (c?.id) ids.add(c.id);
+  }
+  return ids;
+}
+
+/**
+ * A tool RESULT and the assistant tool_call that spawned it are one atomic
+ * unit — split them and the upstream rejects with
+ *   400 "No tool call found for function call output with call_id …"
+ * because every function_call_output must match an earlier function_call of
+ * the same id. The newest-first split can leave a result LIVE while its call
+ * SPILLED (the call is older, so it lands in spill; the result is newer, so it
+ * stays live). MEASURED: an agent run compacted 19,738->11,025 tokens and the
+ * orphaned result 400'd the whole turn.
+ *
+ * Fix: pull messages back from the end of spill into live until every live
+ * tool result's defining call is also live. Costs a few tokens of compaction,
+ * never correctness.
+ */
+export function keepToolPairs(live: Msg[], spill: Msg[]): { live: Msg[]; spill: Msg[] } {
+  const callIdOf = (m: Msg) => (m as { tool_call_id?: string }).tool_call_id;
+  const dangles = (l: Msg[]) => {
+    const defined = definedCallIds(l);
+    return l.some((m) => m.role === "tool" && callIdOf(m) && !defined.has(callIdOf(m) as string));
+  };
+  let l = live;
+  let s = spill;
+  while (s.length && dangles(l)) {
+    l = [s[s.length - 1], ...l];
+    s = s.slice(0, -1);
+  }
+  return { live: l, spill: s };
+}
+
 /** Newest-first walk: keep whole recent turns inside the live window, spill the rest. */
 function split(msgs: Msg[], keepTokens: number): { live: Msg[]; spill: Msg[] } {
   const live: Msg[] = [];
@@ -116,7 +186,96 @@ export async function prepare(
   if (!cfg.lecoreUrl) return off("LECORE_HRR_URL unset");
   if (before <= cfg.lecoreSpillTokens) return off("under spill threshold");
 
+  // TOOL CONVERSATIONS ARE FORWARDED INTACT. keepToolPairs keeps a call with
+  // its result across the spill boundary, but that is not enough for a
+  // provider whose tool API is STATEFUL (OpenAI/Azure Responses API): removing
+  // ANY message and prepending a recalled-context system message invalidates
+  // the server-side correlation, and the continuation 400s with
+  //   "No tool call found for function call output with call_id …"
+  // MEASURED: multi-turn agent runs on openai/gpt-5.6-sol-pro failed
+  // repeatedly while every synthetic spill reproduced clean. So when tool
+  // calls are present we do not spill at all — the body forwards whole and the
+  // fail-open pricing (markup 1) means the caller is not overcharged for it.
+  const hasTools = msgs.some((m) =>
+    Array.isArray((m as { tool_calls?: unknown[] }).tool_calls)
+    || m.role === "tool"
+    || (Array.isArray(m.content) && (m.content as Array<{ type?: string }>).some(
+      (b) => b?.type === "tool_use" || b?.type === "tool_result")));
+
+  // STRUCTURE-PRESERVING SPILL for tool conversations.
+  //
+  // A stateful provider (OpenAI/Azure Responses API) correlates tool calls by
+  // id; removing a spilled message or reordering the array breaks that and the
+  // continuation 400s "No tool call found for function call output". But the
+  // provider does NOT care how LONG a tool result is — only that its envelope
+  // (role, tool_call_id, order) is present. So keep EVERY message in place and
+  // only shrink the heavy CONTENT of older ones, binding the full text to the
+  // sidecar and replacing it with a short marker. Nothing is removed => nothing
+  // can be orphaned; the big tokens (accumulated tool-result dumps) still leave
+  // the request => the discount survives.
+  if (hasTools) {
+    const KEEP_TAIL = 4;               // most recent messages stay verbatim
+    const SHRINK_OVER = 400;           // only shrink content longer than this
+    const HEAD = 200;                  // chars of the original head to retain
+    const cut = Math.max(0, msgs.length - KEEP_TAIL);
+    const oldMsgs = msgs.slice(0, cut);
+    const items = oldMsgs
+      .map((m, i) => ({ text: `[${i}] ${m.role ?? "user"}: ${text(m.content)}` }))
+      .filter((it) => it.text.trim().length > 0);
+    if (!items.length) return off("nothing older than the live window");
+    try {
+      const bind = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/bind`,
+        { tenant_id: cfg.lecoreTenant, items, chunk: true,
+          chunk_max_chars: cfg.lecoreChunkChars, chunk_overlap: cfg.lecoreChunkOverlap,
+          ...(thread ? { context_id: thread } : {}) }, cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { context_id?: string };
+      const contextId = bind?.context_id;
+      if (!contextId) throw new Error("bind returned no context_id");
+      const query = askOf(text(msgs[msgs.length - 1]?.content), cfg.lecoreQueryChars);
+      const rec = (await post(`${cfg.lecoreUrl}/internal/v1/hrr/recall`,
+        { tenant_id: cfg.lecoreTenant, context_id: contextId, query, top_k: cfg.lecoreTopK },
+        cfg.lecoreTimeoutMs, cfg.lecoreKey)) as { items?: Array<{ text?: string }> };
+      const slice = (rec?.items ?? []).map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
+      const MARK = " … [older turn — full text in the retrieved context above]";
+      const shrunk = oldMsgs.map((m) => {
+        const t = text(m.content);
+        if (t.length <= SHRINK_OVER) return m; // small enough, leave alone
+        // ARRAY CONTENT MUST SHRINK TOO. Anthropic-shaped bodies carry tool
+        // results as content BLOCKS, not strings — an earlier version only
+        // shrank strings, so every tool_result was skipped and the request
+        // GREW (recalled slice added, nothing removed): measured 14,856 ->
+        // 14,899. Shrink the text INSIDE each block and keep the block's
+        // type/tool_use_id, so the provider's correlation is still intact.
+        if (Array.isArray(m.content)) {
+          const blocks = (m.content as Array<Record<string, unknown>>).map((b) => {
+            const bt = typeof b?.text === "string" ? (b.text as string)
+              : typeof b?.content === "string" ? (b.content as string) : null;
+            if (bt === null || bt.length <= SHRINK_OVER) return b;
+            const short = bt.slice(0, HEAD) + MARK;
+            return typeof b.text === "string" ? { ...b, text: short } : { ...b, content: short };
+          });
+          return { ...m, content: blocks };
+        }
+        return { ...m, content: t.slice(0, HEAD) + MARK }; // plain string
+      });
+      const tail = msgs.slice(cut);
+      const rebuilt: Msg[] = slice
+        ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote((rec?.items ?? []).length, cfg.lecoreCorpusChunks)}` }, ...shrunk, ...tail]
+        : [...shrunk, ...tail];
+      const after = estimateTokens(rebuilt);
+      return {
+        body: { ...body, messages: rebuilt },
+        info: { engaged: true, contextId, tokensBefore: before, tokensAfter: after, spilledTokens: before - after, mode: "spill" },
+      };
+    } catch (e) {
+      const why = (e as Error).message.slice(0, 120);
+      if (cfg.lecoreRequired) throw new Error(`lecore_unavailable: ${why}`);
+      return off(`fail-open: ${why}`);
+    }
+  }
+
   let { live, spill } = split(msgs, cfg.lecoreSpillTokens);
+  // Never orphan a tool result from its call across the spill boundary.
+  ({ live, spill } = keepToolPairs(live, spill));
 
   // INTRA-MESSAGE SPILL. Turn-granularity is not enough: a needle-in-a-haystack
   // prompt (and any pasted document) is ONE message holding the whole corpus AND
@@ -125,7 +284,16 @@ export async function prepare(
   // context-bench NIAH: 10,345 tokens, engaged=false, answered by raw attention.
   // So when the live window is still oversized, carve the LAST message: keep its
   // tail (the actual ask) and spill the head as passages.
-  if (spill.length === 0 && live.length > 0) {
+  //
+  // THE GUARD IS "live is still fat", NOT "spill is empty". Requiring an empty
+  // spill was a real, expensive bug: an agent conversation (older turns + a
+  // huge recent tool result / pasted corpus) put the older turns in spill and
+  // then left the giant last message WHOLE in the live window — MEASURED in
+  // production, a 2.78MB Cursor body reported tokens_before == tokens_after ==
+  // 677,948, i.e. leCore "engaged" and forwarded the entire book anyway, at
+  // $3.39 a call, repeatedly. Single-message bodies spilled fine, which is why
+  // it survived testing. Carve whenever the live window is over the threshold.
+  if (estimateTokens(live) > cfg.lecoreSpillTokens && live.length > 0) {
     const lastIdx = live.length - 1;
     const body_ = text(live[lastIdx].content);
     const tailChars = cfg.lecoreTailChars;
@@ -140,8 +308,10 @@ export async function prepare(
       // fact split across two chunks is retrievable from neither") and splits
       // on paragraphs instead. So send the head WHOLE and let the sidecar
       // chunk it with leCore; `chunk: true` on bind does that server-side.
+      // Preserve anything already destined for spill — older turns come first
+      // so the bound corpus keeps conversation order.
       const passages: Msg[] = [{ role: live[lastIdx].role ?? "user", content: head }];
-      spill = [...live.slice(0, lastIdx), ...passages];
+      spill = [...spill, ...live.slice(0, lastIdx), ...passages];
       live = [{ ...live[lastIdx], content: tail }];
     }
   }
@@ -178,7 +348,7 @@ export async function prepare(
     const slice = (rec?.items ?? []).map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
 
     const rebuilt: Msg[] = slice
-      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}` }, ...live]
+      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote((rec?.items ?? []).length, cfg.lecoreCorpusChunks)}` }, ...live]
       : live;
     const after = estimateTokens(rebuilt);
     return {
@@ -231,7 +401,7 @@ export async function attach(
     const items = ((rec as { items?: Array<{ text?: string }> })?.items ?? []);
     const slice = items.map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
     const rebuilt: Msg[] = slice
-      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}` }, ...msgs]
+      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote(items.length, cfg.lecoreCorpusChunks)}` }, ...msgs]
       : msgs;
     const after = estimateTokens(rebuilt);
     return {
@@ -276,4 +446,123 @@ export async function bindPassthrough(
   }
   const out = json as { object?: string; context_id?: string; bound?: number };
   return { status: 200, payload: { object: out.object ?? "hrr.context", context_id: out.context_id, bound: out.bound } };
+}
+
+/**
+ * Right-to-forget, as an endpoint.
+ *
+ * The engine's store is a commutative monoid — merge(A,B).ablate(B) == A — so
+ * removing one source is a subtraction, not a rebuild. Exposing it matters
+ * because a product that says "connect your whole life" is only honest if
+ * disconnecting actually takes the data back out, provably, on demand.
+ *
+ * Delegates to the sidecar's unbind with all:true for a whole context, or a
+ * specific item_ids list. Free, like bind: charging for deletion is hostile.
+ */
+export async function ablatePassthrough(
+  cfg: Config,
+  body: { context_id?: string; item_ids?: string[] },
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  if (!body.context_id) return { status: 400, payload: { error: "context_id required" } };
+
+  const ids = Array.isArray(body.item_ids) ? body.item_ids : [];
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/hrr/unbind`,
+    { tenant_id: cfg.lecoreTenant, context_id: body.context_id,
+      ...(ids.length ? { item_ids: ids } : { all: true }) },
+    cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string };
+    return { status, payload: { error: j?.error || `ablate -> ${status}` } };
+  }
+  const out = json as { removed?: number; unbound?: number; object?: string };
+  return {
+    status: 200,
+    payload: {
+      object: "hrr.ablate",
+      context_id: body.context_id,
+      removed: out.removed ?? out.unbound ?? 0,
+    },
+  };
+}
+
+/**
+ * OUROBOROS memory — the model's durable external partition, per-tenant.
+ *
+ * Free passthroughs (like bindPassthrough): writing and reading your OWN memory
+ * is infrastructure, not a metered inference. The sidecar still returns
+ * `_meta.lecore.cost` + `_meta.lecore.receipt` on every call, so a metered lane
+ * can be layered on later without changing the wire. See the sidecar's
+ * ouroboros.py and leCore docs/ZOO.md §7-8.
+ */
+export async function memoryWrite(
+  cfg: Config,
+  body: { text?: string; tags?: string[] },
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  if (typeof body.text !== "string" || !body.text.trim()) return { status: 400, payload: { error: "text (string) required" } };
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/memory/write`,
+    { tenant_id: cfg.lecoreTenant, text: body.text, tags: Array.isArray(body.tags) ? body.tags : [] },
+    cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string; code?: string };
+    return { status, payload: { error: j?.error || `memory_write -> ${status}`, code: j?.code } };
+  }
+  return { status: 200, payload: json as Record<string, unknown> };
+}
+
+export async function memorySearch(
+  cfg: Config,
+  body: { query?: string; top?: number; tags?: string[] },
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  if (typeof body.query !== "string" || !body.query.trim()) return { status: 400, payload: { error: "query (string) required" } };
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/memory/search`,
+    { tenant_id: cfg.lecoreTenant, query: body.query, top: body.top ?? 4, ...(Array.isArray(body.tags) ? { tags: body.tags } : {}) },
+    cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string; code?: string };
+    return { status, payload: { error: j?.error || `memory_search -> ${status}`, code: j?.code } };
+  }
+  return { status: 200, payload: json as Record<string, unknown> };
+}
+
+
+/**
+ * leCore's own faculties, proxied — docs/ZOO.md §1, §9, §11.
+ *
+ * `find` is Rule-0 for the whole zoo ("before implementing any algorithm, ask
+ * whether leCore already has it"); `invoke` runs any of 3,214 capabilities
+ * through leCore's OWN dispatch, so private-faculty refusals and the wire
+ * conventions are inherited rather than re-enforced here. Discovery is free —
+ * charging to look at a catalog would just make models hand-roll instead.
+ */
+export async function lecoreCall(
+  cfg: Config,
+  op: "find" | "describe" | "invoke",
+  body: Record<string, unknown>,
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  // AGAINST lecore-front, NOT the HRR sidecar. The sidecar deliberately imports
+  // only four leCore modules; building the full faculty surface next to
+  // bind/recall OOM'd it mid-bind on 20MB chunks (see hrr-context _lecore.py).
+  // leCore's own service already exposes /tools + /invoke on its own app, so
+  // discovery and heavy faculties run there and cannot starve retrieval.
+  if (!cfg.lecoreFrontUrl) return { status: 503, payload: { error: "lecore_unconfigured: LECORE_FRONT_URL unset" } };
+  const path = op === "invoke" ? "/invoke" : "/tools";
+  const payload = op === "invoke"
+    ? { name: body.name, args: body.args || {} }
+    : { query: body.query ?? body.name, top: body.top ?? 8 };
+  // SHORT, SEPARATE TIMEOUT. lecore-front builds its faculty catalog on demand
+  // and an authed /tools has been measured not answering inside 300s, with no
+  // request line logged (FastAPI logs on completion) — i.e. still grinding.
+  // Inheriting the sidecar's generous timeout would hang a caller for minutes
+  // on a discovery call; a fast, honest failure is strictly better than that.
+  const frontMs = Number(process.env.LECORE_FRONT_TIMEOUT_MS || 8000);
+  const { status, json } = await postRaw(`${cfg.lecoreFrontUrl}${path}`,
+    payload, frontMs, cfg.lecoreFrontKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string; code?: string };
+    return { status, payload: { error: j?.error || `lecore_${op} -> ${status}`, code: j?.code } };
+  }
+  return { status: 200, payload: json as Record<string, unknown> };
 }

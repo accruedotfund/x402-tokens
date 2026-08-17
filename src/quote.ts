@@ -39,18 +39,65 @@ export interface Quote {
   discount?: number;
   savesVsDirect?: number;
   flooredAtCost?: boolean;
+  /** Media only. Names HOW the upstream cost was derived ("per-image",
+   *  "per-megapixel", "per-clip-block") because for image/video it is an
+   *  estimate against a vendor example rather than a metered token count —
+   *  the caller should be able to see that distinction in the 402. */
+  priceModel?: string;
+}
+
+/**
+ * WEB SEARCH IS A FLAT SURCHARGE, AND IT IS NOT SMALL.
+ *
+ * OpenRouter's `web` plugin is search-then-inject middleware, so it works on
+ * EVERY model — there is no such thing as a model here that "cannot" search,
+ * and nothing needs routing to a search-native model. What it is not is free.
+ *
+ * MEASURED 2026-08-16 against google/gemini-2.5-flash, twice, exact to 6dp:
+ *   max_results=1 -> total $0.007174, tokens $0.000174, web portion $0.007000
+ *   max_results=3 -> total $0.0072551, tokens $0.0002551, web portion $0.007000
+ * Flat per request, NOT per result. Left unpriced it is ruinous on cheap
+ * models: that first call's tokens are worth $0.000255, so quoting from tokens
+ * alone would have billed ~28x under our own cost — and we settle before the
+ * upstream call, so every one of those is a straight loss.
+ */
+export const WEB_PLUGIN_USD = Number(process.env.WEB_PLUGIN_USD || 0.007);
+
+/** True when this body will make OpenRouter run a web search — either the
+ *  `web` plugin, or the `:online` model shorthand which implies it. */
+export function usesWebSearch(body: { model?: string; plugins?: unknown }): boolean {
+  if (typeof body.model === "string" && body.model.endsWith(":online")) return true;
+  const plugins = body.plugins;
+  if (!Array.isArray(plugins)) return false;
+  return plugins.some((p) => p && typeof p === "object" && (p as { id?: string }).id === "web");
+}
+
+/** `:online` is an OpenRouter routing shorthand, not a catalog id — the model
+ *  list has no "…:online" row, so pricing must look up the bare model while the
+ *  suffix still ships upstream. */
+export function baseModelId(id: string): string {
+  return id.endsWith(":online") ? id.slice(0, -":online".length) : id;
 }
 
 export async function quoteRequest(
   cfg: Config,
-  body: { model?: string; messages?: unknown; max_tokens?: number },
+  body: { model?: string; messages?: unknown; max_tokens?: number; plugins?: unknown },
   counterfactualTokens?: number,
 ): Promise<Quote> {
   const modelId = body.model || cfg.defaultModel;
-  const model = await getModel(cfg.openrouterUrl, cfg.openrouterKey, modelId);
+  const model = await getModel(cfg.openrouterUrl, cfg.openrouterKey, baseModelId(modelId));
+  const webUsd = usesWebSearch(body) ? WEB_PLUGIN_USD : 0;
   const promptTokens = estimateTokens(body.messages);
-  const maxOut = Math.min(Math.max(1, Number(body.max_tokens ?? 256)), 4096);
-  const baseUsd = openrouterUsd(model.prompt, model.completion, promptTokens, maxOut);
+  // MEASURED (ttfx goldrun, 2026-08-15): reasoning models BILL their thinking.
+  // Callers asked 8k-32k max_tokens and providers charged 16-19k completion
+  // tokens per ask, but this clamp priced at most 4,096 of output — the floor
+  // protected $0.37 of a $1.62 upstream completion and sol/fable ran at
+  // negative margin for hours. The clamp exists to stop absurd quotes on
+  // absurd asks; 32k covers every real reasoning budget we have seen.
+  const maxOut = Math.min(Math.max(1, Number(body.max_tokens ?? 256)), 32768);
+  // web surcharge rides on the UPSTREAM cost, so it flows through markup, the
+  // counterfactual floor and every rail conversion exactly like token cost
+  const baseUsd = openrouterUsd(model.prompt, model.completion, promptTokens, maxOut) + webUsd;
 
   // COUNTERFACTUAL PRICING. A markup on the tokens we forward is
   // anti-correlated with a product whose whole job is to forward fewer tokens:
@@ -73,9 +120,23 @@ export async function quoteRequest(
     : null;
   const counterfactual = direct !== null && cfg.discount > 0;
   const floorUsd = baseUsd * cfg.floorMultiple;
+  // NO CLIFF. The two modes used to be exclusive, which made price
+  // NON-MONOTONIC in body size: MEASURED on the live gateway, 40,000 chars
+  // billed $0.096426 (markup) while 42,000 chars billed $0.047421
+  // (counterfactual) — sending MORE data cost HALF. That is not just ugly, it
+  // is exploitable: the rational move is to pad every body past the spill
+  // threshold, which wastes the caller's bandwidth and OUR upstream tokens to
+  // buy a discount. It also punishes exactly the careful user who trims their
+  // prompt.
+  //
+  // So the markup is a CEILING, never a cliff: whenever a counterfactual price
+  // exists, the caller pays the lower of the two. Below the spill threshold
+  // nothing changes (there is no counterfactual to compare against), and above
+  // it nobody can game a discount by inflating a body.
+  const markupUsd = baseUsd * cfg.markup;
   const billedUsd = counterfactual
-    ? Math.max(direct * cfg.discount, floorUsd)
-    : baseUsd * cfg.markup;
+    ? Math.min(Math.max(direct * cfg.discount, floorUsd), markupUsd)
+    : markupUsd;
   const pricedAt = new Date().toISOString();
 
   const accepts: QuoteLine[] = [];
@@ -108,9 +169,16 @@ export async function quoteRequest(
     pricedAt,
     accepts,
     pricing: counterfactual ? "counterfactual" : "markup",
-    directUsd: direct ?? undefined,
+    // LIKE-FOR-LIKE DENOMINATOR (same bug class the margin fix caught): when
+    // leCore's compression never engaged, "what this would cost buying direct"
+    // is trivially what it DID cost (baseUsd) -- not undefined/0. Leaving it
+    // undefined here means usage.ts's sum (Number(e.directUsd)||0) only counts
+    // the handful of compressed calls while cogsToday/paidWithCogsToday sum
+    // every paid call, so "leCore saving" divides mismatched populations and
+    // renders as a fake LOSS (direct << paid) instead of "no saving on this call".
+    directUsd: direct ?? baseUsd,
     discount: counterfactual ? cfg.discount : undefined,
-    savesVsDirect: direct ? direct / billedUsd : undefined,
+    savesVsDirect: (direct ?? baseUsd) / billedUsd,
     flooredAtCost: counterfactual ? direct * cfg.discount < floorUsd : undefined,
   };
 }
@@ -139,11 +207,28 @@ export async function dexScreenerUsd(a: Asset): Promise<number> {
 /** Live USD for a non-stable. Fail-closed on every source. */
 export async function spotUsd(cfg: Config, a: Asset): Promise<number> {
   if (a.stableUsd) return a.stableUsd;
-  if (a.priceSource === "dexscreener") return dexScreenerUsd(a);
+  if (a.priceSource === "dexscreener") {
+    try {
+      return await dexScreenerUsd(a);
+    } catch (e) {
+      // FALL BACK, don't fail closed on one aggregator's coverage gap. A token
+      // with no DexScreener pool is not a token with no price: IOU lost its
+      // pool and its row vanished from every 402, while Birdeye still quoted
+      // it. Only a token BOTH sources refuse is genuinely unpriceable.
+      if (!cfg.birdeyeKey) throw e;
+      console.error(`quote: ${a.symbol} dexscreener miss (${(e as Error).message}) — trying birdeye`);
+    }
+  }
   if (!cfg.birdeyeKey) throw new Error("BIRDEYE_API_KEY required to price " + a.symbol);
   const u = new URL("https://public-api.birdeye.so/defi/price");
   u.searchParams.set("address", a.priceMint);
-  const r = await fetch(u, { headers: { "X-API-KEY": cfg.birdeyeKey, "x-chain": "solana" } });
+  // CHAIN COMES FROM THE ASSET. This was hardcoded to "solana", which meant a
+  // non-Solana asset could never be priced by Birdeye no matter what its
+  // priceSource said — IOU on Robinhood Chain silently had no usable source and
+  // its row was dropped from every live 402.
+  const r = await fetch(u, {
+    headers: { "X-API-KEY": cfg.birdeyeKey, "x-chain": a.priceChain ?? "solana" },
+  });
   if (!r.ok) throw new Error(`birdeye ${r.status}`);
   const j = (await r.json()) as { success?: boolean; data?: { value?: number } };
   const v = j.data?.value;
@@ -183,12 +268,78 @@ export async function spotUsdCached(cfg: Config, a: Asset): Promise<{ usd: numbe
   }
 }
 
-export async function quoteLive(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }, counterfactualTokens?: number): Promise<Quote> {
-  const q = await quoteRequest(cfg, body, counterfactualTokens);
+/**
+ * MEDIA QUOTE. An image or a video has no prompt/completion tokens to price,
+ * so the token path above cannot express it: the upstream charges per
+ * generation (or per megapixel, or per clip-block) and that number arrives
+ * already in USD. This builds the same Quote shape from a flat upstream cost
+ * so the whole 402 machinery — requirements(), challenge(), verify(),
+ * settle() — works unchanged on media routes.
+ *
+ * Markup only, never the counterfactual discount: the discount exists because
+ * leCore makes us forward FEWER tokens than the caller would have bought
+ * direct, and there is no such saving on a diffusion job. Applying it here
+ * would be charging half price for work we pay full price for.
+ */
+export function quoteUnits(cfg: Config, modelId: string, upstreamUsd: number, priceModel: string): Quote {
+  if (!(upstreamUsd >= 0) || !Number.isFinite(upstreamUsd)) throw new Error("bad media cost");
+  const billedUsd = upstreamUsd * cfg.markup;
+  const pricedAt = new Date().toISOString();
+  const accepts: QuoteLine[] = [];
+  for (const a of cfg.assets) {
+    const tokenUsd = a.stableUsd ?? 1;
+    const net = usdToRaw(billedUsd, tokenUsd, a.decimals);
+    accepts.push({
+      symbol: a.symbol,
+      mint: a.mint,
+      network: a.network ?? cfg.network,
+      decimals: a.decimals,
+      tokenUsd,
+      billedUsd,
+      netRaw: net.toString(),
+      grossRaw: grossUp(net, a.feeBps).toString(),
+      feeBps: a.feeBps,
+      pricedAt,
+      payTo: a.payTo,
+      eip712: a.eip712,
+    });
+  }
+  return {
+    model: modelId,
+    promptTokensEst: 0,
+    maxOut: 0,
+    openrouterUsd: upstreamUsd,
+    markup: cfg.markup,
+    billedUsd,
+    pricedAt,
+    accepts,
+    pricing: "markup",
+    priceModel,
+  };
+}
+
+/** Live-spot every non-stable row, dropping any we cannot price. Shared by the
+ *  token and media quote paths so a media 402 can never advertise a rail on a
+ *  stale or invented price that the text path would have rejected. */
+async function applyLiveSpots(cfg: Config, q: Quote): Promise<Quote> {
+  // An asset with no believable price DROPS OUT of accepts[] rather than
+  // killing the whole 402 or shipping an invented number. One dead pool must
+  // not take down every other rail; equally, a row without a live spot is a
+  // price we made up — never emit it. (Observed: IOU's DexScreener pool
+  // vanished 2026-08-14 — pairs list empty — while ODDBALLER/ROBINHOODS
+  // still quote.)
+  const unpriceable = new Set<string>();
   for (const line of q.accepts) {
     const a = cfg.assets.find((x) => x.mint === line.mint);
     if (!a || a.stableUsd) continue;
-    const spot = await spotUsdCached(cfg, a);
+    let spot;
+    try {
+      spot = await spotUsdCached(cfg, a);
+    } catch (e) {
+      console.error(`quote: dropping ${a.symbol} row — no live price (${(e as Error).message})`);
+      unpriceable.add(line.mint);
+      continue;
+    }
     const net = usdToRaw(q.billedUsd, spot.usd, a.decimals);
     line.tokenUsd = spot.usd;
     line.netRaw = net.toString();
@@ -198,5 +349,15 @@ export async function quoteLive(cfg: Config, body: { model?: string; messages?: 
       line.pricedAt = new Date(spot.at).toISOString();
     }
   }
+  if (unpriceable.size) q.accepts = q.accepts.filter((l) => !unpriceable.has(l.mint));
   return q;
+}
+
+export async function quoteLive(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }, counterfactualTokens?: number): Promise<Quote> {
+  return applyLiveSpots(cfg, await quoteRequest(cfg, body, counterfactualTokens));
+}
+
+/** Media equivalent of quoteLive: flat upstream cost in, fully-priced 402 out. */
+export async function quoteMediaLive(cfg: Config, modelId: string, upstreamUsd: number, priceModel: string): Promise<Quote> {
+  return applyLiveSpots(cfg, quoteUnits(cfg, modelId, upstreamUsd, priceModel));
 }
