@@ -58,7 +58,30 @@ export interface Config {
   openrouterKey: string;
   openrouterUrl: string;
   birdeyeKey: string;
+  /** Media upstream (image/video). Empty -> the media routes 503 and the
+   *  gateway is text-only, exactly as it was before they existed. */
+  togetherKey: string;
+  togetherUrl: string;
+  /** Video lives on a DIFFERENT api version than images — v2, and on
+   *  api.together.ai. Separate field because the /v1 video route exists,
+   *  accepts requests, and fails every model. */
+  togetherVideoUrl: string;
+  /** x-ai/* models route here directly instead of through OpenRouter's BYOK
+   *  passthrough, which 400s with an invalid xAI key it doesn't control.
+   *  Pricing is untouched — quoteLive still reads OpenRouter's catalog price
+   *  for the model id, which is what the customer is billed regardless of
+   *  which upstream actually serves the completion. Empty -> x-ai/* falls
+   *  back to OpenRouter (today's broken behavior), not a hard failure. */
+  xaiKey: string;
+  xaiUrl: string;
   defaultModel: string;
+  defaultImageModel: string;
+  /** Web search for EVERY model, on by default. OpenRouter's web plugin is
+   *  model-agnostic middleware, so there is no "unsupported model" case to
+   *  route around. Flat $0.007/request upstream — priced into the 402. */
+  webSearchDefault: boolean;
+  webMaxResults: number;
+  defaultVideoModel: string;
   lecoreUrl: string;
   lecoreKey: string;
   lecoreTenant: string;
@@ -79,6 +102,21 @@ export interface Config {
   lecoreChunkOverlap: number;
   lecoreTimeoutMs: number;
   lecoreRequired: boolean;
+  /**
+   * Require X-Openzoo-Namespace to carry a valid wallet signature
+   * (X-Openzoo-Namespace-Sig/-Signer/-Ts) before it is trusted for tenant
+   * isolation. Unset/0 (default): unsigned namespaces still work exactly as
+   * before (soft launch — see nsauth.ts / tenantFor in server.ts), a valid
+   * signature is preferred when present, and an invalid signature just logs
+   * and falls through to the legacy unsigned path. "1": an unsigned or
+   * invalid namespace claim falls back to the shared BASE tenant rather than
+   * 401 — these are documented free passthroughs (/v1/hrr/bind etc.) and a
+   * hard failure here would break that for every caller who has not
+   * upgraded yet.
+   */
+  lecoreRequireSignedNamespace: boolean;
+  /** Replay window for a signed namespace claim's timestamp. */
+  lecoreNamespaceSigWindowMs: number;
   assets: Asset[];
 }
 
@@ -230,7 +268,21 @@ export function loadConfig(): Config {
     openrouterKey: req("OPENROUTER_API_KEY"),
     openrouterUrl: opt("OPENROUTER_URL", "https://openrouter.ai/api/v1").replace(/\/$/, ""),
     birdeyeKey: opt("BIRDEYE_API_KEY", ""),
+    // MEDIA LANE. OpenRouter serves no video at all and only 9 image models,
+    // so image/video ride a separate upstream. Unset -> /v1/images/* and
+    // /v1/videos/* answer 503 and nothing else changes.
+    togetherKey: opt("TOGETHER_API_KEY", ""),
+    togetherUrl: opt("TOGETHER_URL", "https://api.together.xyz/v1").replace(/\/$/, ""),
+    xaiKey: opt("XAI_API_KEY", ""),
+    xaiUrl: opt("XAI_URL", "https://api.x.ai/v1").replace(/\/$/, ""),
+    togetherVideoUrl: opt("TOGETHER_VIDEO_URL", "https://api.together.ai/v2").replace(/\/$/, ""),
     defaultModel: opt("DEFAULT_MODEL", "google/gemini-2.5-flash"),
+    // cheap + fast (measured 0.14s), so an unspecified image request still
+    // returns something rather than erroring on a missing field
+    webSearchDefault: opt("WEB_SEARCH_DEFAULT", "1") === "1",
+    webMaxResults: Number(opt("WEB_MAX_RESULTS", "3")),
+    defaultImageModel: opt("DEFAULT_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell"),
+    defaultVideoModel: opt("DEFAULT_VIDEO_MODEL", "Wan-AI/wan2.7-t2v"),
     // leCore in front: HRR sidecar that spills long bodies before the 402 is
     // priced. Unset -> plain passthrough, byte-identical to today.
     lecoreUrl: opt("LECORE_HRR_URL", "").replace(/\/$/, ""),
@@ -249,6 +301,8 @@ export function loadConfig(): Config {
     lecoreChunkOverlap: Number(opt("LECORE_CHUNK_OVERLAP", "300")),
     lecoreTimeoutMs: Number(opt("LECORE_TIMEOUT_MS", "10000")),
     lecoreRequired: opt("LECORE_REQUIRED", "0") === "1",
+    lecoreRequireSignedNamespace: opt("LECORE_REQUIRE_SIGNED_NAMESPACE", "0") === "1",
+    lecoreNamespaceSigWindowMs: Number(opt("LECORE_NAMESPACE_SIG_WINDOW_MS", "300000")), // 5 min
     assets,
   };
 }

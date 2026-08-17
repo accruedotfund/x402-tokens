@@ -34,6 +34,27 @@ Content-Type: application/json
 Body is a normal OpenRouter/OpenAI chat completion:
 {"model":"${cfg.defaultModel}","messages":[{"role":"user","content":"..."}],"max_tokens":256}
 
+IMAGE AND VIDEO ARE ALSO SERVED, on their own endpoints. /v1/chat/completions
+cannot emit them — do not conclude from a text response that this endpoint has
+no media. Same 402 and same rails; billed per image or per clip, not per token.
+
+POST ${cfg.publicUrl}/v1/images/generations
+{"model":"${cfg.defaultImageModel}","prompt":"...","width":1024,"height":1024}
+  -> {"data":[{"url":"https://..."}]}
+
+POST ${cfg.publicUrl}/v1/videos/generations
+{"model":"${cfg.defaultVideoModel}","prompt":"...","seconds":5,"resolution":"720P"}
+  -> {"id":"...","status":"in_progress"}     resolution is "720P" or "1080P"
+
+GET  ${cfg.publicUrl}/v1/videos/{id}
+  -> {"status":"completed","outputs":{"video_url":"https://..."}}
+  Polling is FREE — the render was paid for at submit. Poll until status
+  leaves "in_progress"; a failed job explains itself in error.message.
+
+GET /v1/models lists these alongside the text models, tagged kind:"image" or
+kind:"video" with the per-unit price. leCore memory does NOT apply to a render
+(a prompt that short never spills) — do not claim it improved the output.
+
 You will get HTTP 402. That is the product, not an error.
 
 accepts[] will include one row per offered rail. Pick ONE:
@@ -240,7 +261,7 @@ footer{color:var(--dim);font-size:.85rem}
   <section class=prove>
     <div class=kicker>prompt your clanker</div>
     <h2>Dump this into Claude / Grok / Codex. It has everything.</h2>
-    <p class=lede style="margin-top:.4rem;font-size:var(--0)">No SDK. No OpenRouter key. If it can POST and sign — a Solana <code>TransferChecked</code>, or an <code>EIP-3009</code> authorization on Base or Robinhood Chain — it can buy inference here. Raw prompt also at <a href="/prompt.txt"><code>/prompt.txt</code></a>.</p>
+    <p class=lede style="margin-top:.4rem;font-size:var(--0)">No SDK. No provider key. If it can POST and sign — a Solana <code>TransferChecked</code>, or an <code>EIP-3009</code> authorization on Base or Robinhood Chain — it can buy inference here. Raw prompt also at <a href="/prompt.txt"><code>/prompt.txt</code></a>.</p>
     <div class=row>
       <button id=copyclanker type=button>copy prompt</button>
     </div>
@@ -258,6 +279,27 @@ footer{color:var(--dim);font-size:.85rem}
     </div>
     <pre id=out>${esc(curl)}</pre>
     <div class=meta id=status>unpaid POST · expect HTTP 402</div>
+  </section>
+
+  <!-- MEDIA. The storefront advertised chat only, which stopped being true the
+       moment /v1/images and /v1/videos shipped — and agents were reading this
+       page, seeing text endpoints, and concluding the zoo could not do media at
+       all. Same 402, same rails, different unit of billing. -->
+  <section>
+    <div class=kicker>pictures and moving pictures</div>
+    <h2>It is not only text.</h2>
+    <p class=lede style="margin-top:.4rem;font-size:var(--0)">Image and video generate on their own endpoints — same 402, same rails, but billed <strong>per image or per clip</strong>, not per token. <code>GET /v1/models</code> lists them with <code>kind:"image"</code> / <code>kind:"video"</code> and the price per unit.</p>
+    <pre>POST /v1/images/generations
+{"model":"black-forest-labs/FLUX.1-schnell","prompt":"...","width":1024,"height":1024}
+  -> 200 {"data":[{"url":"https://..."}]}
+
+POST /v1/videos/generations
+{"model":"Wan-AI/wan2.7-t2v","prompt":"...","seconds":5,"resolution":"720P"}
+  -> 200 {"id":"...","status":"in_progress"}
+
+GET  /v1/videos/{id}          # free to poll — the render was paid for at submit
+  -> 200 {"status":"completed","outputs":{"video_url":"https://..."}}</pre>
+    <div class=meta>video is asynchronous: you pay once at submit, then poll for free until <code>status</code> leaves <code>in_progress</code> · <code>resolution</code> is <code>720P</code> or <code>1080P</code></div>
   </section>
 
   <section>

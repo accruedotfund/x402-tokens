@@ -55,9 +55,16 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
     // makes the EIP-3009 `to` unparseable and every Base/RH payment unsignable.
     payTo: a.payTo ?? cfg.payTo,
     resource,
+    // NAME THE RIGHT UPSTREAM. Media rides Together, not OpenRouter, and a
+    // receipt that misnames where the work happened is a receipt nobody can
+    // reconcile. priceModel is set only on the media path, so it doubles as
+    // the discriminator and tells the payer this is a per-unit estimate
+    // against a vendor example rather than a metered token count.
     description: q.pricing === "counterfactual"
       ? `${q.model} — ${(q.savesVsDirect ?? 1).toFixed(1)}× cheaper than buying direct, at ${a.pricedAt}`
-      : `OpenRouter ${q.model} × ${q.markup} at ${a.pricedAt}`,
+      : q.priceModel
+        ? `Together ${q.model} × ${q.markup}, ${q.priceModel} at ${a.pricedAt}`
+        : `OpenRouter ${q.model} × ${q.markup} at ${a.pricedAt}`,
     maxTimeoutSeconds: 120,
     extra: {
       facilitator: cfg.facilitator,

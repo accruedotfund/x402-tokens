@@ -449,6 +449,44 @@ export async function bindPassthrough(
 }
 
 /**
+ * Right-to-forget, as an endpoint.
+ *
+ * The engine's store is a commutative monoid — merge(A,B).ablate(B) == A — so
+ * removing one source is a subtraction, not a rebuild. Exposing it matters
+ * because a product that says "connect your whole life" is only honest if
+ * disconnecting actually takes the data back out, provably, on demand.
+ *
+ * Delegates to the sidecar's unbind with all:true for a whole context, or a
+ * specific item_ids list. Free, like bind: charging for deletion is hostile.
+ */
+export async function ablatePassthrough(
+  cfg: Config,
+  body: { context_id?: string; item_ids?: string[] },
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  if (!cfg.lecoreUrl) return { status: 503, payload: { error: "hrr_unconfigured: LECORE_HRR_URL unset" } };
+  if (!body.context_id) return { status: 400, payload: { error: "context_id required" } };
+
+  const ids = Array.isArray(body.item_ids) ? body.item_ids : [];
+  const { status, json } = await postRaw(`${cfg.lecoreUrl}/internal/v1/hrr/unbind`,
+    { tenant_id: cfg.lecoreTenant, context_id: body.context_id,
+      ...(ids.length ? { item_ids: ids } : { all: true }) },
+    cfg.lecoreTimeoutMs, cfg.lecoreKey);
+  if (status < 200 || status >= 300) {
+    const j = json as { error?: string };
+    return { status, payload: { error: j?.error || `ablate -> ${status}` } };
+  }
+  const out = json as { removed?: number; unbound?: number; object?: string };
+  return {
+    status: 200,
+    payload: {
+      object: "hrr.ablate",
+      context_id: body.context_id,
+      removed: out.removed ?? out.unbound ?? 0,
+    },
+  };
+}
+
+/**
  * OUROBOROS memory — the model's durable external partition, per-tenant.
  *
  * Free passthroughs (like bindPassthrough): writing and reading your OWN memory

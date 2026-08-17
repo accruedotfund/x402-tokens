@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "./config.js";
 import { complete, listModels } from "./openrouter.js";
 import { clankerPrompt, renderIndex } from "./page.js";
-import { quoteLive } from "./quote.js";
-import { attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
+import { quoteLive, quoteMediaLive } from "./quote.js";
+import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, submitVideo, unitCostUsd } from "./together.js";
+import { ablatePassthrough, attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
+import { verifySignedNamespace } from "./nsauth.js";
 import { applyCredit, creditBalance, grantCredit } from "./credits.js";
 import { dedupObserve } from "./dedup.js";
 import * as usage from "./usage.js";
@@ -34,11 +36,73 @@ const here = fileURLToPath(new URL(".", import.meta.url));
  * Hashed, not used raw: the namespace should not become a way to write
  * arbitrary tenant strings into the sidecar, and hashing bounds the shape.
  * Callers that send nothing keep the legacy shared tenant.
+ *
+ * UNVERIFIED, though: a raw namespace string is just whatever the caller
+ * typed — nothing checks the caller actually controls the wallet (or other
+ * identity) that string is supposed to represent. Anyone who learns or
+ * guesses another caller's namespace (e.g. from a leaked log line) gets
+ * read/write access to that tenant's leCore memory just by resending it.
+ *
+ * X-Openzoo-Namespace-Sig / -Signer / -Ts let a caller PROVE namespace
+ * ownership: sign `openzoo-namespace:<namespace>:<timestamp>` (see
+ * nsauth.ts) with the same wallet key x402 payments already use (Solana
+ * ed25519 or EVM secp256k1 — config.ts assets[].network), inside a short
+ * replay window. When that checks out, the tenant is hashed from the
+ * VERIFIED signer identity, not the caller-supplied string, so the string
+ * itself stops being the access-control boundary.
+ *
+ * Soft launch (cfg.lecoreRequireSignedNamespace, env
+ * LECORE_REQUIRE_SIGNED_NAMESPACE, default "0"): unsigned namespaces and
+ * invalid signatures still fall through to the pre-existing raw-hash
+ * behavior — same as today, just logged — until the flag flips to "1", at
+ * which point an unsigned or invalid claim loses the custom namespace
+ * (falls back to the shared base tenant) instead of getting one. Never a
+ * hard 401: every route that calls tenantFor is a documented free
+ * passthrough (see /v1/hrr/bind, /v1/lecore/* below), and refusing the
+ * request outright would break that for callers mid-migration — losing
+ * isolation gracefully is the correct failure mode here, not losing the
+ * endpoint.
  */
+function headerStr(req: IncomingMessage, name: string): string | undefined {
+  const v = req.headers[name];
+  const s = Array.isArray(v) ? v[0] : v;
+  return typeof s === "string" && s.length ? s : undefined;
+}
+
 function tenantFor(cfg: Config, req: IncomingMessage): string {
   const ns = req.headers["x-openzoo-namespace"];
   if (typeof ns !== "string" || !ns.trim()) return cfg.lecoreTenant;
-  const h = createHash("sha256").update(ns.trim()).digest("hex").slice(0, 16);
+  const namespace = ns.trim();
+
+  const sig = headerStr(req, "x-openzoo-namespace-sig");
+  const signer = headerStr(req, "x-openzoo-namespace-signer");
+  const ts = headerStr(req, "x-openzoo-namespace-ts");
+  const chain = headerStr(req, "x-openzoo-namespace-chain");
+  const signAttempted = !!(sig || signer || ts);
+
+  if (signAttempted) {
+    const v = verifySignedNamespace({ namespace, signature: sig, signer, timestamp: ts, chain }, cfg.lecoreNamespaceSigWindowMs);
+    if (v.ok && v.signer && v.chain) {
+      // Hash signer AND namespace, not just the raw string: binding in the
+      // proven signer closes the squatting hole (another wallet signing the
+      // identical namespace label lands in a DIFFERENT tenant, since its
+      // signer differs), while keeping the namespace in the hash means one
+      // wallet can still run several isolated namespaces (e.g. per project)
+      // instead of collapsing to a single tenant per wallet.
+      const h = createHash("sha256").update(`${v.chain}:${v.signer}:${namespace}`).digest("hex").slice(0, 16);
+      return `${cfg.lecoreTenant}_${h}`;
+    }
+    logEvent({ path: req.url, status: "namespace_sig_invalid", reason: v.reason });
+    if (cfg.lecoreRequireSignedNamespace) return cfg.lecoreTenant;
+    // soft launch: fall through to the legacy raw-hash path below.
+  } else if (cfg.lecoreRequireSignedNamespace) {
+    logEvent({ path: req.url, status: "namespace_unsigned", reason: "signing required, no signature sent" });
+    return cfg.lecoreTenant;
+  } else {
+    logEvent({ path: req.url, status: "namespace_unsigned" });
+  }
+
+  const h = createHash("sha256").update(namespace).digest("hex").slice(0, 16);
   return `${cfg.lecoreTenant}_${h}`;
 }
 
@@ -313,7 +377,7 @@ export function createServerFor(cfg: Config) {
           resource,
           type: "http",
           x402Version: 1,
-          description: "OpenRouter chat completions. 3× USD, priced at the 402.",
+          description: "Chat completions, image generation and video generation. Priced at the 402 in USD.",
           accepts: requirements(cfg, q, resource),
         }],
       });
@@ -338,7 +402,166 @@ export function createServerFor(cfg: Config) {
         max_single_post_tokens: MAX_SINGLE_POST_TOKENS,
         ...(m.context ? { max_model_len: m.context } : {}),
       }));
+      // MEDIA MODELS BELONG IN THE SAME LIST. A client discovering the zoo
+      // through /v1/models would otherwise conclude — correctly, for the text
+      // upstream, and wrongly for the gateway — that nothing here makes images
+      // or video. They carry `kind` and `endpoint` so a caller knows not to
+      // POST them to /v1/chat/completions, and `pricing.unit` instead of
+      // per-token rates because that is genuinely how they bill.
+      if (cfg.togetherKey) {
+        try {
+          const media = await listMedia(cfg.togetherUrl, cfg.togetherKey);
+          for (const m of media.byId.values()) {
+            data.push({
+              id: m.id,
+              object: "model",
+              owned_by: m.organization ?? "together",
+              kind: m.kind,
+              endpoint: `/v1/${m.kind}s/generations`,
+              pricing: {
+                unit: m.perMegapixelUsd ? "megapixel" : m.kind === "video" ? "clip" : "image",
+                usd: (m.perMegapixelUsd ?? m.exampleUsd) * cfg.markup,
+                basis: m.exampleNote,
+                markup: cfg.markup,
+              },
+            } as unknown as typeof data[number]);
+          }
+        } catch (e) {
+          // the text catalog must still serve if the media upstream is down
+          console.error(`models: media catalog unavailable (${(e as Error).message})`);
+        }
+      }
       return json(res, 200, { object: "list", data });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * MEDIA LANE — image and video.
+     *
+     * A separate upstream and a separate price model, because neither fits
+     * the text path: OpenRouter serves no video at all, and a diffusion job
+     * has no prompt/completion tokens to meter. See together.ts.
+     *
+     * Polling a video job is FREE and comes first: the caller already paid at
+     * submit, and charging per poll would make a slow render cost more than a
+     * fast one for identical work.
+     * ------------------------------------------------------------------ */
+    if (req.method === "GET" && url.pathname.startsWith("/v1/videos/")) {
+      if (!cfg.togetherKey) return json(res, 503, { error: "media lane not configured" });
+      const id = decodeURIComponent(url.pathname.slice("/v1/videos/".length));
+      if (!id) return json(res, 400, { error: "job id required" });
+      const r = await pollVideo(cfg.togetherVideoUrl, cfg.togetherKey, id);
+      logEvent({ path: "/v1/videos/generations/:id", status: "free", ip: shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined) });
+      return json(res, r.status, r.json);
+    }
+
+    if (req.method === "POST" && (url.pathname === "/v1/images/generations" || url.pathname === "/v1/videos/generations")) {
+      const kind = url.pathname === "/v1/images/generations" ? "image" : "video";
+      if (!cfg.togetherKey) {
+        return json(res, 503, { error: { message: "media lane not configured on this gateway", code: "media_unconfigured" } });
+      }
+      const raw = await readBody(req);
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(raw || "{}") as Record<string, unknown>;
+      } catch {
+        return json(res, 400, { error: "invalid json" });
+      }
+      const ip = shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined);
+      // Accept BOTH shapes. Together's video route wants the args nested under
+      // `payload` while every other endpoint takes them flat; making callers
+      // remember which is which is a papercut we can absorb here.
+      const payload = (body.payload && typeof body.payload === "object" ? body.payload : body) as Record<string, unknown>;
+      const prompt = payload.prompt ?? body.prompt;
+      if (typeof prompt !== "string" || !prompt.trim()) return json(res, 400, { error: "prompt required" });
+
+      const modelId = String(body.model || (kind === "image" ? cfg.defaultImageModel : cfg.defaultVideoModel));
+      let m;
+      try {
+        m = await getMedia(cfg.togetherUrl, cfg.togetherKey, modelId);
+      } catch (e) {
+        return json(res, 400, { error: { message: (e as Error).message, code: "model_not_found" } });
+      }
+      if (m.kind !== kind) {
+        return json(res, 400, {
+          error: { message: `${modelId} is a ${m.kind} model — POST it to /v1/${m.kind}s/generations`, code: "wrong_endpoint" },
+        });
+      }
+
+      const width = Number(payload.width ?? 1024);
+      const height = Number(payload.height ?? 1024);
+      const n = Number(payload.n ?? 1);
+      const seconds = payload.seconds !== undefined ? Number(payload.seconds) : undefined;
+      const priceModel = kind === "image"
+        ? (m.perMegapixelUsd ? "per-megapixel" : "per-image")
+        : "per-clip-block";
+      const upstreamUsd = unitCostUsd(m, { width, height, seconds, n });
+      const q = await quoteMediaLive(cfg, modelId, upstreamUsd, priceModel);
+      // The x402 `resource` must name what is actually being bought. The
+      // module-level one is hardcoded to /v1/chat/completions, and a payment
+      // authorization bound to that URL for an image job is a receipt that
+      // does not match the work — and, for any facilitator that checks the
+      // resource, an outright mismatch.
+      const mediaResource = `${cfg.publicUrl}${url.pathname}`;
+      const reqs = requirements(cfg, q, mediaResource);
+      const bodyBytes = Buffer.byteLength(raw);
+      const evt = (status: string, extra: Record<string, unknown> = {}) =>
+        logEvent({ path: url.pathname, status, model: modelId, kind, bodyBytes, ip, ...extra });
+
+      const header = req.headers["x-payment"] as string | undefined;
+      const tenantKey = tenantFor(cfg, req);
+      let paidByCredit = false;
+      if (!header && q.billedUsd > 0 && creditBalance(tenantKey) >= q.billedUsd) {
+        applyCredit(tenantKey, q.billedUsd);
+        paidByCredit = true;
+        evt("credit_used", { billedUsd: q.billedUsd });
+      }
+      if (!header && !paidByCredit) {
+        evt("402_quoted", { billedUsd: q.billedUsd, priceModel });
+        return json(res, 402, challenge(cfg, q, mediaResource), { "x-402-priced-at": q.pricedAt });
+      }
+      const v = paidByCredit
+        ? { ok: true as const, picked: { asset: "credit", maxAmountRequired: "0" } as never, payer: tenantKey }
+        : await verify(cfg, header as string, reqs);
+      if (!v.ok || !v.picked) {
+        evt("402_invalid", { reason: (v.reason ?? "invalid payment").slice(0, 200) });
+        return json(res, 402, challenge(cfg, q, mediaResource, v.reason ?? "invalid payment"));
+      }
+      const settled = paidByCredit
+        ? { success: true, transaction: "credit", payer: tenantKey }
+        : (await settle(cfg, header as string, v.picked).catch((e) => ({ success: false, errorReason: (e as Error).message }))) as
+          { success?: boolean; errorReason?: string; transaction?: string; payer?: string };
+      if (!settled.success) {
+        const reason = (settled.errorReason ?? "settle failed").slice(0, 300);
+        evt("failed_settle", { payer: settled.payer ?? v.payer, reason, billedUsd: q.billedUsd });
+        return json(res, 402, challenge(cfg, q, mediaResource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt });
+      }
+
+      const out = kind === "image"
+        ? await generateImage(cfg.togetherUrl, cfg.togetherKey, { ...payload, model: modelId, prompt })
+        : await submitVideo(cfg.togetherVideoUrl, cfg.togetherKey, modelId, {
+            ...payload,
+            prompt,
+            // seconds is a STRING upstream, and resolution must be 720P/1080P
+            // or the job is accepted and then fails — after we have settled.
+            seconds: String(payload.seconds ?? 5),
+            resolution: normalizeResolution(payload.resolution),
+          });
+
+      // Paid, then the upstream failed: credit it back in full. Same contract
+      // as the text lane — we cannot un-settle on chain, so the tenant carries
+      // the balance forward instead of eating our outage.
+      if (out.status < 200 || out.status >= 300) {
+        if (q.billedUsd > 0 && !paidByCredit) {
+          grantCredit(tenantKey, q.billedUsd, `${kind} upstream ${out.status}`);
+        }
+        evt("upstream_error", { upstream: out.status, billedUsd: q.billedUsd, credited: !paidByCredit });
+        return json(res, out.status, out.json);
+      }
+      evt("served", { billedUsd: q.billedUsd, upstreamUsd, priceModel, tx: settled.transaction });
+      return json(res, 200, out.json, {
+        "x-402-billed-usd": String(q.billedUsd),
+        "x-402-price-model": priceModel,
+      });
     }
 
     // "The body never ships twice": bind a corpus once, then ask with
@@ -362,6 +585,23 @@ export function createServerFor(cfg: Config) {
         ip: shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined),
         http: status,
       });
+      return json(res, status, payload);
+    }
+
+    // Right-to-forget. Free, and it really removes: see ablatePassthrough.
+    if (req.method === "POST" && url.pathname === "/v1/hrr/ablate") {
+      const raw = await readBody(req);
+      let body: Record<string, unknown>;
+      try { body = JSON.parse(raw || "{}"); } catch { return json(res, 400, { error: "invalid json" }); }
+      const ctxHint = typeof body.context_id === "string" ? body.context_id : undefined;
+      const { status, payload } = await withTenantFallback(
+        cfg, req,
+        (c) => ablatePassthrough(c, body as { context_id?: string; item_ids?: string[] }),
+        ctxHint,
+      );
+      logEvent({ path: url.pathname, status: "free", bodyBytes: Buffer.byteLength(raw),
+                 ip: shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined),
+                 http: status });
       return json(res, status, payload);
     }
 
@@ -409,6 +649,26 @@ export function createServerFor(cfg: Config) {
         return json(res, 400, { error: "invalid json" });
       }
       if (!body.messages) return json(res, 400, { error: "messages required" });
+
+      // WEB SEARCH ON, FOR EVERY MODEL, BY DEFAULT.
+      //
+      // OpenRouter's `web` plugin is search-then-inject middleware, so it works
+      // on every model in the catalog — "does this model support search" is not
+      // a real question here, and nothing needs rerouting to a search-native
+      // model. Without it an agent on this gateway answers "I don't have direct
+      // access to external tools like search engines" and confidently fails any
+      // question about the last year, which is the single most visible way the
+      // zoo looks broken next to a chat app.
+      //
+      // Opt out per request with plugins: [] (an explicit empty array), or
+      // globally with WEB_SEARCH_DEFAULT=0. An explicit plugins array is always
+      // respected as-is — we only ADD when the caller said nothing at all.
+      //
+      // It is not free: a flat $0.007 upstream per request (see WEB_PLUGIN_USD),
+      // which quoteRequest adds to the upstream cost so the 402 reflects it.
+      if (cfg.webSearchDefault && (body as { plugins?: unknown }).plugins === undefined) {
+        (body as { plugins?: unknown }).plugins = [{ id: "web", max_results: cfg.webMaxResults }];
+      }
       const bodyBytes = Buffer.byteLength(raw);
       const ip = shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined);
 
@@ -556,7 +816,20 @@ export function createServerFor(cfg: Config) {
         return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt });
       }
 
-      let out = await complete(cfg.openrouterUrl, cfg.openrouterKey, { ...prepped, stream: false }, cfg.publicUrl);
+      // x-ai/* goes straight to xAI, not through OpenRouter's BYOK passthrough
+      // (which 400s on a key it doesn't control — measured, see credits.ts).
+      // Pricing is untouched: quoteRequest/quoteLive already read OpenRouter's
+      // catalog price for this model id, and that is what the caller is
+      // billed regardless of which upstream serves the completion. `plugins`
+      // is an OpenRouter-only field (the web-search injection above) and does
+      // not exist on xAI's API, so it is dropped on this path.
+      const modelId = String((prepped as { model?: string }).model ?? "");
+      const isDirectXai = modelId.startsWith("x-ai/") && !!cfg.xaiKey;
+      const callUpstream = (b: Record<string, unknown>) => isDirectXai
+        ? complete(cfg.xaiUrl, cfg.xaiKey, { ...b, plugins: undefined, model: modelId.slice("x-ai/".length) }, cfg.publicUrl)
+        : complete(cfg.openrouterUrl, cfg.openrouterKey, b, cfg.publicUrl);
+
+      let out = await callUpstream({ ...prepped, stream: false });
 
       // PAID-FOR-SILENCE GUARD. A reasoning model can spend the WHOLE
       // max_tokens budget on hidden reasoning and get truncated before it
@@ -594,8 +867,7 @@ export function createServerFor(cfg: Config) {
       if (emptyTruncated(out) && askedTok < 512) {
         const roomier = 1024;
         console.log("retry", JSON.stringify({ reason: "empty_truncated", asked: askedTok, roomier }));
-        const retry = await complete(cfg.openrouterUrl, cfg.openrouterKey,
-          { ...prepped, stream: false, max_tokens: roomier }, cfg.publicUrl);
+        const retry = await callUpstream({ ...prepped, stream: false, max_tokens: roomier });
         if (!emptyTruncated(retry) && retry.status >= 200 && retry.status < 300) out = retry;
       } else if (emptyTruncated(out)) {
         // Large caps: do NOT re-run. Say so in the response instead of
@@ -614,6 +886,12 @@ export function createServerFor(cfg: Config) {
         payer: settled.payer ?? v.payer,
         upstream: out.status,
         billedUsd: q.billedUsd,
+        // WHAT IT COST US, and WHAT IT WOULD HAVE COST THE CALLER DIRECT.
+        // Without these two the usage store can only ever answer "revenue" —
+        // margin and the leCore saving are unrecoverable after the fact,
+        // because both are derived from the quote and the quote is gone.
+        cogsUsd: q.openrouterUsd,
+        directUsd: q.directUsd,
         tx: settled.transaction, // public on-chain; the receipt a caller can verify themselves
       });
       return json(res, out.status, {

@@ -34,8 +34,10 @@ ok(existsSync(file + ".1"), "one older generation is kept");
 
 // paid rows carry the FULL payer + tx; the public projection drops the ip
 const PAYER = "HLyPVoGK3yxkUoCybWQiHXETEPA8KxPdpQ1Q9pVGGhku";
-u.record(ev(200, { status: "paid_200", payer: PAYER, billedUsd: 0.0002, tx: "SIG1", upstream: 200 }));
-u.record(ev(201, { status: "paid_200", payer: PAYER, billedUsd: 0.0004, tx: "SIG2", upstream: 200 }));
+// paid rows use ts=NOW: paidToday counts the CURRENT utc day, and hardcoded
+// event dates rotted this test two days after it was written
+u.record({ ...ev(200, { status: "paid_200", payer: PAYER, billedUsd: 0.0002, tx: "SIG1", upstream: 200 }), ts: new Date().toISOString() });
+u.record({ ...ev(201, { status: "paid_200", payer: PAYER, billedUsd: 0.0004, tx: "SIG2", upstream: 200 }), ts: new Date(Date.now() + 1000).toISOString() });
 
 const mine = u.localEventsFor(PAYER, 10);
 ok(mine.length === 2, "localEventsFor finds both paid rows for the exact address");

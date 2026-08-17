@@ -202,6 +202,18 @@ export type Shard = {
   counts: Record<string, number>;
   usdPaidToday: number;
   usdPaidTotal: number;
+  /** What the upstream charged US for today's paid calls — revenue minus this
+   *  is the real margin. Optional so shards from an older build still merge. */
+  cogsToday?: number;
+  /** Revenue summed ONLY over calls that also recorded cogs — the correct
+   *  denominator for margin. See the note in localSummary. */
+  paidWithCogsToday?: number;
+  paidWithCogsTotal?: number;
+  cogsTotal?: number;
+  /** What those same bodies would have cost the caller buying direct, i.e. the
+   *  leCore saving. Only present on calls where a counterfactual existed. */
+  directToday?: number;
+  directTotal?: number;
   callsToday: number;
   callsTotal: number;
   paidToday: number;
@@ -223,6 +235,17 @@ export function localSummary(): Shard {
   const payersToday = new Set<string>();
   const payersTotal = new Set<string>();
   let usdPaidToday = 0, usdPaidTotal = 0, callsToday = 0, paidToday = 0, paidTotal = 0;
+  // MARGIN AND THE leCore SAVING, not just revenue. cogsUsd is what the
+  // upstream actually charged us and directUsd is what this exact body would
+  // have cost the caller buying direct — both come off the quote, so if they
+  // are not summed here they cannot be reconstructed later.
+  let cogsToday = 0, cogsTotal = 0, directToday = 0, directTotal = 0;
+  // LIKE-FOR-LIKE DENOMINATOR. Margin computed as (allPaid - cogs)/allPaid is a
+  // lie whenever the window straddles the upgrade that started recording cogs:
+  // MEASURED 2026-08-16, $3.90 of pre-upgrade revenue against $0.0000327 of
+  // cogs renders 99.999% margin. Sum revenue ONLY over calls that also carry a
+  // cogs figure, so the ratio is over the same set of calls.
+  let paidWithCogsToday = 0, paidWithCogsTotal = 0;
   for (const e of ring) {
     const isToday = String(e.ts).slice(0, 10) === today;
     const status = e.status || "unknown";
@@ -236,7 +259,17 @@ export function localSummary(): Shard {
     if (PAID.has(status)) {
       paidTotal += 1;
       usdPaidTotal += Number(e.billedUsd) || 0;
-      if (isToday) { paidToday += 1; usdPaidToday += Number(e.billedUsd) || 0; }
+      const c = Number((e as { cogsUsd?: number }).cogsUsd) || 0;
+      cogsTotal += c;
+      if (c > 0) paidWithCogsTotal += Number(e.billedUsd) || 0;
+      directTotal += Number((e as { directUsd?: number }).directUsd) || 0;
+      if (isToday) {
+        paidToday += 1;
+        usdPaidToday += Number(e.billedUsd) || 0;
+        cogsToday += c;
+        if (c > 0) paidWithCogsToday += Number(e.billedUsd) || 0;
+        directToday += Number((e as { directUsd?: number }).directUsd) || 0;
+      }
     }
   }
   return {
@@ -246,6 +279,12 @@ export function localSummary(): Shard {
     counts,
     usdPaidToday: round(usdPaidToday),
     usdPaidTotal: round(usdPaidTotal),
+    cogsToday: round(cogsToday),
+    paidWithCogsToday: round(paidWithCogsToday),
+    paidWithCogsTotal: round(paidWithCogsTotal),
+    cogsTotal: round(cogsTotal),
+    directToday: round(directToday),
+    directTotal: round(directTotal),
     callsToday,
     callsTotal: ring.length,
     paidToday,
@@ -382,6 +421,15 @@ export function mergeShards(shards: Shard[]) {
       avgUsdPerPaidCall: paidToday ? round(usdPaidToday / paidToday) : 0,
       distinctPayers: payersToday.size,
       byStatus: counts,
+      // THE THREE NUMBERS THAT MATTER TOGETHER, never revenue alone:
+      //   usdPaid  what callers paid us
+      //   usdCogs  what the upstream charged us for the same work
+      //   usdDirect what those bodies would have cost buying direct (leCore off)
+      // marginPct is only meaningful when usdPaid > 0; savedVsDirect only when
+      // a counterfactual actually existed, so both are null rather than 0.
+      usdCogs: round(shards.reduce((n, x) => n + (Number((x as { cogsToday?: number }).cogsToday) || 0), 0)),
+      usdPaidWithCogs: round(shards.reduce((n, x) => n + (Number((x as { paidWithCogsToday?: number }).paidWithCogsToday) || 0), 0)),
+      usdDirect: round(shards.reduce((n, x) => n + (Number((x as { directToday?: number }).directToday) || 0), 0)),
     },
     retained_window: {
       calls: callsTotal,
